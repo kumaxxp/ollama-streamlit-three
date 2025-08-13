@@ -1,3 +1,5 @@
+conda activate ollama-chat
+
 # 🤖 Ollama Streamlit Chat
 
 ローカルLLMと対話するための高機能WebUIチャットシステム。Ollama + Streamlitで構築された、拡張可能なAIチャットプラットフォームです。
