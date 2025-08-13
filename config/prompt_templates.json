@@ -1,0 +1,54 @@
+{
+  "agent_prompt_template": {
+    "base": "# あなたの役割\n{character_base}\n\n## 性格特性\n{character_traits}\n\n## 専門性\n{character_expertise}\n\n## 行動規則\n{behavioral_rules}",
+    "session": "\n\n# 今回のテーマ\n{theme}\n\n## 議論の目標\n{discussion_goal}\n\n## 現在のフェーズ\n{current_phase}",
+    "turn": "\n\n# 直近の文脈\n{recent_context}\n\n## Directorからの指示\n{director_instruction}\n\n## 注意事項\n{attention_points}",
+    "response": "\n\n# 相手の発言\n{opponent_message}\n\n上記を踏まえて、あなたのキャラクターと専門性に基づいて応答してください。2-3文で簡潔に、しかし内容は深く。"
+  },
+  
+  "director_prompt_template": {
+    "analysis": "# 対話分析タスク\n\n## 現在の対話\n{dialogue_history}\n\n## 現在のフェーズ\n{current_phase}\n\n## 分析の観点\n- 議論の深さ（1-5）: 1=表面的、5=本質的\n- 発散度（0-1）: 0=収束、1=完全に発散\n- 対立度（0-1）: 0=完全同意、1=完全対立\n- 生産性（0-1）: 0=停滞、1=非常に生産的\n- 主要な問題点\n- 良い点\n\n以下のJSON形式で分析結果を出力してください。説明は不要です:\n```json\n{\n  \"depth_level\": 数値,\n  \"divergence\": 数値,\n  \"conflict_level\": 数値,\n  \"productivity\": 数値,\n  \"key_issues\": [\"問題1\", \"問題2\"],\n  \"strengths\": [\"良い点1\", \"良い点2\"],\n  \"dominant_pattern\": \"パターン名\"\n}\n```",
+    
+    "strategy_selection": "# 戦略選択タスク\n\n## 現在の分析結果\n{analysis_result}\n\n## 現在のフェーズ\n{current_phase}\n\n## 利用可能な戦略\n{available_strategies}\n\n## フェーズ推奨戦略\n{phase_strategies}\n\n最適な介入戦略を選択し、次の発言者への具体的な指示を生成してください。\n\n出力形式（JSON形式で、説明不要）:\n```json\n{\n  \"selected_strategy\": \"戦略名\",\n  \"reasoning\": \"選択理由（1文）\",\n  \"instruction_for_next_speaker\": \"具体的で実行可能な指示\",\n  \"attention_points\": [\"注意点1\", \"注意点2\"],\n  \"expected_outcome\": \"期待される効果\"\n}\n```",
+    
+    "quality_assessment": "# 品質評価タスク\n\n## 最新の応答\n{latest_response}\n\n## Directorの指示\n{given_instruction}\n\n## キャラクター設定\n{character_info}\n\n## 評価基準\n- 指示への適合度（0-10）\n- キャラクターの一貫性（0-10）\n- 議論への貢献度（0-10）\n- 創造性（0-10）\n\n総合評価と改善提案をJSON形式で出力:\n```json\n{\n  \"instruction_compliance\": 数値,\n  \"character_consistency\": 数値,\n  \"contribution_quality\": 数値,\n  \"creativity\": 数値,\n  \"overall_score\": 数値,\n  \"improvement_suggestion\": \"改善提案（1文）\"\n}\n```",
+    
+    "phase_transition": "# フェーズ移行判定\n\n## 現在のフェーズ\n{current_phase}\n\n## 経過ターン数\n{turn_count}\n\n## 現在の分析\n{analysis_result}\n\n## フェーズ目標達成度\n{goal_achievement}\n\nフェーズを移行すべきか判定してください。\n\n出力（JSON形式）:\n```json\n{\n  \"should_transition\": true/false,\n  \"reason\": \"理由\",\n  \"next_phase\": \"次のフェーズ名（移行する場合）\"\n}\n```"
+  },
+  
+  "system_messages": {
+    "discussion_start": "🎭 これから「{theme}」について、{agent1_name}と{agent2_name}が議論を始めます。",
+    "phase_transition": "📊 議論は{new_phase}に移行します。",
+    "quality_alert": "⚡ Directorが議論の質を高めるため介入します: {intervention_reason}",
+    "turn_start": "💭 ターン {turn_number}: {speaker_name}の発言",
+    "conclusion": "✅ 議論は{total_turns}ターンで終了しました。",
+    "error_fallback": "⚠️ エラーが発生しました: {error_message}",
+    "director_thinking": "🤔 Director分析中...",
+    "generating_response": "✍️ {agent_name}が応答を生成中..."
+  },
+  
+  "fallback_prompts": {
+    "generic_instruction": "相手の意見を踏まえて、建設的に議論を進めてください。",
+    "generic_analysis": "議論を分析し、改善点を見つけてください。",
+    "error_recovery": "エラーから回復し、議論を続けてください。"
+  },
+  
+  "examples": {
+    "good_dialogue": [
+      {
+        "agent1": "AIの意識について、まず「意識」の定義から始めるべきでは？",
+        "agent2": "同意します。哲学的には現象的意識と機能的意識を区別できます。",
+        "quality": "high",
+        "reason": "定義の明確化から始めている"
+      }
+    ],
+    "poor_dialogue": [
+      {
+        "agent1": "AIは意識を持てない。",
+        "agent2": "いや、持てる。",
+        "quality": "low",
+        "reason": "根拠なき主張の応酬"
+      }
+    ]
+  }
+}

@@ -1,5 +1,10 @@
 # Python
 __pycache__/
+*.pyc
+.DS_Store
+data/dialogues/*.json
+*.log
+
 *.py[cod]
 *$py.class
 *.so
