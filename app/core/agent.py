@@ -189,6 +189,13 @@ class Agent:
         prompt_parts.append(f"\n上記を踏まえて、{opponent_name}に対して{self.character['name']}として応答してください。")
         prompt_parts.append("自然で、あなたらしい発言を心がけてください。")
         
+        # フォーマット指示を追加
+        prompt_parts.append("\n【応答形式の注意】")
+        prompt_parts.append("- 挨拶（こんにちは等）は不要です。すぐに本題に入ってください")
+        prompt_parts.append("- 箇条書きや見出しは使わず、自然な会話文で応答してください")
+        prompt_parts.append("- マークダウン記号（##、**、-、・など）は使わないでください")
+        prompt_parts.append("- 普通に会話するような、流れるような文章で話してください")
+        
         return "\n".join(prompt_parts)
     
     async def generate_response(self, context: Dict) -> str:
