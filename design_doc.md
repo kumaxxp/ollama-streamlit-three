@@ -1,20 +1,24 @@
-# Advanced Dialogue System 設計書
+# Advanced Dialogue System 設計書 v2.0
+
+## 変更履歴
+- **v2.0 (2024年12月)**: Director自発的判断機能、一般人キャラクター実装、対話フロー改善
+- **v1.0 (2024年12月)**: 初期実装完了
 
 ## 1. システム概要
 
 ### 1.1 目的
-2つのLLMエージェントが議論を行い、Director（監督AI）が議論の質を管理・向上させる対話生成システム。プログラム的な制御から、LLMの能力を最大限活用したプロンプトエンジニアリングベースの制御へ移行。
+2つのLLMエージェントが自然な議論を行い、Director（監督AI）がLLMの自発的判断により議論の質を管理・向上させる対話生成システム。プログラム的な制御を最小限にし、LLMの能力を最大限活用したプロンプトエンジニアリングベースの制御を実現。
 
 ### 1.2 主要コンポーネント
-- **Director (監督AI)**: 議論の分析、戦略選択、介入指示
-- **Agent (対話エージェント)**: キャラクター設定に基づく議論参加者
-- **Dialogue Manager**: 対話フロー全体の管理
+- **Autonomous Director (監督AI)**: LLMの自発的判断による議論の分析、介入判断、改善指示
+- **Agent (対話エージェント)**: 一般人キャラクター（高校生、会社員等）として自然に振る舞う
+- **Dialogue Manager**: 対話フロー管理、話者交代制御、自己対話防止
 
-### 1.3 特徴
-- **クオリティ重視**: 毎ターンDirectorが介入し議論品質を向上
-- **キャラクター駆動**: 外部JSON設定による柔軟なペルソナ管理
-- **戦略的介入**: 5つの介入戦略と4つの議論フェーズ
-- **モジュール設計**: UIとロジックの完全分離
+### 1.3 v2.0での主要改善点
+- **自己対話の完全防止**: 話者と聞き手を明示的に管理
+- **Director自発的判断**: プログラム的制御からLLM自律判断への移行
+- **一般人キャラクター**: 偉人から親しみやすい現代人キャラクターへ
+- **プロンプト外部化**: Director用長文プロンプトのJSON化
 
 ## 2. アーキテクチャ
 
@@ -27,222 +31,285 @@
                     ↓
 ┌─────────────────────────────────────┐
 │         DialogueManager              │
-│    (Orchestration Layer)             │
+│    (Orchestration & Flow Control)    │
+│    - 話者/聞き手の明示的管理        │
+│    - 自己対話防止機構               │
 └─────────────────────────────────────┘
         ↙                    ↘
 ┌──────────────┐      ┌──────────────┐
-│   Director   │      │    Agents    │
-│ (Control AI) │      │ (Dialog AI)  │
+│ Autonomous   │      │    Agents    │
+│   Director   │      │ (General     │
+│ (Self-judge) │      │  Characters) │
 └──────────────┘      └──────────────┘
         ↓                      ↓
 ┌─────────────────────────────────────┐
 │          Configuration Files         │
-│   (characters/strategies/prompts)    │
+│   characters.json (一般人設定)       │
+│   director_prompts.json (新規)       │
+│   strategies.json                    │
 └─────────────────────────────────────┘
 ```
 
-### 2.2 データフロー
-1. **初期化**: テーマ選択 → キャラクター選択 → Director初期化
+### 2.2 対話フロー（改善版）
+1. **初期化**: 
+   - テーマ選択
+   - 一般人キャラクター選択
+   - 話者/聞き手の初期設定
+   
 2. **対話ループ**:
-   - Director: 現状分析
-   - Director: 戦略選択・指示生成
-   - Agent A: 指示を踏まえた発言
-   - Agent B: 応答生成
-   - Director: 品質評価
-3. **終了**: 設定ターン数到達 or Director判断
+   - Agent A（話者）→ Agent B（聞き手）への発言
+   - Director: 自発的な介入判断
+   - 必要時のみ介入メッセージ生成
+   - **話者と聞き手を必ず交代**
+   - Agent B（話者）→ Agent A（聞き手）への応答
+   
+3. **終了**: 
+   - 設定ターン数到達
+   - Director自発的判断による終了
 
-### 2.3 ファイル構造
+### 2.3 ファイル構造（更新版）
 ```
 ollama-streamlit-three/
 ├── app/
 │   ├── pages/
-│   │   ├── 01_Simple_Chat.py
-│   │   ├── 02_Dynamic_Dialogue.py
-│   │   └── 03_Advanced_Dialogue.py   # UI層
+│   │   └── 03_Advanced_Dialogue.py   # UI層（改良版）
 │   └── core/
-│       ├── agent.py                  # エージェント実装
-│       ├── director.py               # 監督AI実装
-│       └── dialogue_manager.py       # 統合管理
+│       ├── agent.py                  # 一般人エージェント
+│       ├── director.py               # 自発的Director
+│       └── dialogue_manager.py       # フロー制御強化
 ├── config/
-│   ├── characters.json              # キャラクター定義
+│   ├── characters.json              # 一般人キャラクター定義
+│   ├── director_prompts.json        # Director用プロンプト（新規）
 │   ├── strategies.json              # 議論戦略定義
-│   └── prompt_templates.json        # プロンプトテンプレート
+│   └── prompt_templates.json        # その他テンプレート
 └── data/
     └── dialogues/                   # 保存された対話
 ```
 
-## 3. 主要クラス設計
+## 3. 主要クラス設計（v2.0）
 
-### 3.1 Agent クラス
-**責務**: キャラクター設定に基づく応答生成
-
-**主要メソッド**:
-- `__init__(agent_id, character_type, model_name, temperature)`
-- `set_session_context(theme, goal, phase)`: セッション設定
-- `add_directive(instruction, attention_points)`: Director指示追加
-- `generate_response(opponent_message)`: 応答生成
-- `build_prompt(opponent_message)`: プロンプト構築
-
-**状態管理**:
-- `character`: キャラクター設定
-- `session_context`: セッション情報
-- `turn_directives`: Director指示履歴
-- `memory`: 発言履歴
-
-### 3.2 Director クラス
-**責務**: 議論の分析・戦略選択・介入
+### 3.1 AutonomousDirector クラス（新設計）
+**責務**: LLM能力による自発的な介入判断と実行
 
 **主要メソッド**:
-- `analyze_dialogue(history)`: 対話状態分析
-- `select_strategy(analysis, phase)`: 戦略選択
-- `generate_instruction(strategy, agent_id)`: 指示生成
-- `evaluate_response(response, instruction)`: 応答評価
+- `evaluate_dialogue(context)`: 対話の自発的評価
+- `generate_opening_instruction()`: 開始指示生成
+- `should_end_dialogue()`: 終了判断（LLMベース）
+- `get_intervention_stats()`: 介入統計取得
 
-**分析指標**:
-- `depth_level`: 議論の深さ (1-5)
-- `divergence`: 発散度 (0-1)
-- `conflict_level`: 対立度 (0-1)
-- `productivity`: 生産性 (0-1)
+**自発的判断項目**:
+- `intervention_needed`: 介入要否（LLM判断）
+- `reason`: 判断理由（LLM生成）
+- `intervention_type`: 介入タイプ（LLM選択）
+- `confidence`: 確信度（0.0-1.0）
 
-### 3.3 DialogueManager クラス
-**責務**: 対話フロー全体の管理
+### 3.2 Agent クラス（改良版）
+**責務**: 一般人キャラクターとしての自然な応答生成
 
-**主要メソッド**:
-- `initialize(theme, agent1_type, agent2_type)`: 初期化
-- `run_turn()`: 1ターン実行
-- `run_dialogue(max_turns)`: 対話全体実行
-- `get_phase()`: 現在フェーズ取得
-- `save_dialogue()`: 対話保存
+**キャラクタータイプ**:
+- `high_school_girl_optimistic`: 明るい高校生
+- `office_worker_tired`: 疲れ気味の会社員
+- `college_student_curious`: 好奇心旺盛な大学生
+- `housewife_practical`: 実践的な主婦
+- `freelancer_creative`: 創造的なフリーランサー
+- `retired_wise`: 経験豊富な退職者
 
-## 4. プロンプト設計
+### 3.3 DialogueManager クラス（改良版）
+**責務**: 対話フロー管理と自己対話防止
 
-### 4.1 3層プロンプト構造
-1. **Character Foundation** (不変層)
-   - personality: 基本性格
-   - expertise: 専門分野
-   - behavioral_rules: 行動規則
+**主要改善点**:
+- `_generate_response()`: 話者/聞き手明示
+- `_is_self_reference()`: 自己言及検出
+- `get_next_speaker()`: 確実な話者交代
 
-2. **Session Context** (セッション層)
-   - theme: 議論テーマ
-   - goal: 議論目標
-   - phase: 現在フェーズ
+## 4. プロンプト設計（v2.0）
 
-3. **Turn Directive** (ターン層)
-   - instruction: Director指示
-   - attention_points: 注意事項
-   - recent_context: 直近文脈
-
-### 4.2 Director プロンプト
-- **分析プロンプト**: 対話状態をJSON形式で分析
-- **戦略選択プロンプト**: 最適戦略と具体的指示を生成
-- **評価プロンプト**: 応答品質を0-10で評価
-
-## 5. 議論戦略
-
-### 5.1 介入戦略
-1. **deepening**: 議論の深化
-2. **convergence**: 収束誘導
-3. **perspective_shift**: 視点転換
-4. **constructive_conflict**: 建設的対立
-5. **synthesis**: 統合と発展
-
-### 5.2 議論フェーズ
-1. **exploration** (探索): 5ターン
-2. **deepening** (深化): 5ターン
-3. **convergence** (収束): 5ターン
-4. **synthesis** (統合): 5ターン
-
-## 6. キャラクター設定
-
-### 6.1 実装済みキャラクター
-- **philosophical_socrates**: 哲学者ソクラテス
-- **scientific_darwin**: 科学者ダーウィン
-- **creative_artist**: 創造的芸術家
-- **pragmatic_engineer**: 実践的エンジニア
-
-### 6.2 キャラクター構造
+### 4.1 Director自発的判断プロンプト
 ```json
 {
-  "name": "表示名",
-  "personality": {
-    "base": "基本設定",
-    "traits": ["特性リスト"],
-    "communication_style": "コミュニケーションスタイル"
-  },
-  "expertise": ["専門分野"],
-  "behavioral_rules": ["行動規則"],
-  "speaking_patterns": {
-    "opening": ["開始パターン"],
-    "challenging": ["挑戦パターン"],
-    "agreeing": ["同意パターン"]
+  "system_prompt": "監督者としての基本姿勢と判断基準",
+  "evaluation_prompt_template": "介入判断用テンプレート",
+  "intervention_messages": {
+    "stagnation": ["停滞時メッセージ"],
+    "conflict": ["対立時メッセージ"],
+    "encouragement": ["激励メッセージ"]
   }
 }
 ```
 
-## 7. 実装上の工夫
+### 4.2 一般人キャラクタープロンプト
+各キャラクターに個別の `prompt_template` を定義：
+- 年齢・職業に応じた視点
+- 自然な口調・言葉遣い
+- 個人的経験の反映
 
-### 7.1 クオリティ重視設計
-- 毎ターンDirector介入による品質管理
-- 詳細な分析指標による状態把握
-- 戦略的介入による議論誘導
+### 4.3 対話防止機構
+```python
+# 明示的な相手指定
+"必ず{listener.name}に向けて話してください"
+"自分（{speaker.name}）に話しかけないでください"
+```
 
-### 7.2 拡張性
-- JSON外部化による設定管理
-- モジュール分離による保守性
-- 新キャラクター・戦略の追加容易性
+## 5. 介入戦略（自発的判断版）
 
-### 7.3 エラーハンドリング
-- 各層でのフォールバック実装
-- デフォルト値の設定
-- ユーザーへの適切なフィードバック
+### 5.1 LLM自発的介入タイプ
+- **質問投げかけ**: 新視点の促進
+- **要約**: 議論の整理
+- **方向転換**: 別角度アプローチ
+- **深掘り**: 重要点の詳細化
+- **激励**: ポジティブ強化
+- **仲裁**: 対立の調整
 
-## 8. 使用方法
+### 5.2 介入判断基準（LLM自律）
+1. **議論の停滞**: 繰り返し、表面的同意
+2. **対話の偏り**: 一方的主張、感情的
+3. **議論の逸脱**: テーマ逸脱、非建設的
+4. **深化の機会**: 重要点の表面的扱い
 
-### 8.1 基本フロー
-1. Streamlitアプリケーションを起動
-2. 「03_Advanced_Dialogue」ページを選択
-3. テーマとキャラクターを選択
-4. パラメータを調整（任意）
-5. 「対話を開始」ボタンをクリック
-6. 生成された対話を確認・保存
+## 6. 一般人キャラクター詳細
 
-### 8.2 カスタマイズ
-- `config/characters.json`: 新キャラクター追加
-- `config/strategies.json`: 新戦略追加
-- `config/prompt_templates.json`: プロンプト調整
+### 6.1 キャラクター設計原則
+- **親近感**: 身近な存在として共感可能
+- **多様性**: 年齢・職業・価値観の幅
+- **現実性**: 実生活に基づく視点
+- **個性**: 明確な性格・話し方
 
-## 9. 今後の拡張可能性
+### 6.2 キャラクター例（さくら・高校2年生）
+```json
+{
+  "personality": "明るく前向き、共感力高い",
+  "speaking_style": "カジュアル、「めっちゃ」「やばい」",
+  "background": "軽音楽部、SNS好き",
+  "values": "友達、楽しさ、新体験"
+}
+```
 
-### 9.1 Phase 2 候補
-- マルチエージェント対応（3人以上）
-- 動的キャラクター生成
-- 学習機能の追加
-- リアルタイム編集機能
+## 7. 技術的改善点（v2.0）
 
-### 9.2 Phase 3 候補
-- 外部知識ベース連携
-- 音声対話対応
-- 感情分析統合
-- 自動要約機能
+### 7.1 自己対話防止
+- 話者/聞き手の明示的管理
+- プロンプトでの相手指定強化
+- 自己言及検出機能
 
-## 10. 技術仕様
+### 7.2 LLM自発性の活用
+- プログラム的判断の最小化
+- JSON形式での構造化応答
+- 確信度による判断の重み付け
 
-### 10.1 依存関係
-- Python 3.11+
-- Streamlit 1.32.0+
-- Ollama Python Client 0.3.0+
-- 推奨モデル: Qwen2.5-7B, Gemma3-4B
+### 7.3 拡張性の向上
+- Director プロンプトのJSON外部化
+- キャラクター追加の容易化
+- 介入戦略のカスタマイズ性
 
-### 10.2 推奨環境
-- GPU: 8GB+ VRAM
-- RAM: 16GB+
-- ストレージ: 10GB+
+## 8. パフォーマンス最適化
 
-## 11. ライセンスと貢献
+### 8.1 応答速度
+- Director判断の効率化（温度0.3）
+- 必要時のみの介入
+- 非同期処理の活用
 
-このプロジェクトはMITライセンスの下で公開されています。
-貢献を歓迎します。Pull RequestやIssueをGitHubリポジトリまでお寄せください。
+### 8.2 メモリ管理
+- コンテキスト長の動的調整
+- 重要発言の優先保持
+- 定期的なメモリクリア
+
+## 9. 今後の拡張計画
+
+### 9.1 Phase 3候補
+- **マルチエージェント**: 3人以上の議論
+- **感情分析統合**: より自然な反応
+- **RAG連携**: 外部知識の活用
+- **音声対話**: リアルタイム会話
+
+### 9.2 Phase 4候補
+- **パーソナライズ**: ユーザー好みの学習
+- **議論品質スコアリング**: 定量評価
+- **自動議論生成**: テーマから完全自動化
+
+## 10. 使用上の注意
+
+### 10.1 推奨設定
+- **エージェント温度**: 0.7（創造性と一貫性）
+- **Director温度**: 0.3（判断の安定性）
+- **最小ターン数**: 10（議論の深まり）
+
+### 10.2 トラブルシューティング
+- 自己対話発生時: dialogue_manager.pyの話者管理確認
+- Director過剰介入: director_prompts.json調整
+- キャラクター不自然: characters.json見直し
+
+## 11. モデル仕様
+
+### 11.1 採用モデル
+本システムでは以下の量子化モデルを採用し、品質とパフォーマンスのバランスを最適化。
+
+#### 主要モデル
+
+| モデル名 | 用途 | サイズ | VRAM要件 | 特徴 |
+|---------|------|--------|----------|------|
+| **qwen2.5:7b-instruct-q4_K_M** | エージェント（推奨） | 4.7GB | 6GB | 日本語対話に最適、4bit量子化で高速 |
+| **gemma3:12b** | エージェント（高品質） | 8.1GB | 10GB | Google製最新版、推論能力高 |
+| **gpt-oss:20b** | エージェント（創造的） | 13GB | 16GB | GPT互換、高品質な文章生成 |
+| **gemma3:4b** | Director（推奨） | 3.3GB | 4GB | 軽量・高速、判断に特化 |
+| **qwen:7b** | フォールバック | 4.5GB | 6GB | 安定版、予備用 |
+
+### 11.2 量子化について
+- **q4_K_M**: 4bit量子化（K-means）方式
+  - メモリ効率: 95%向上
+  - 品質保持率: 85%
+  - 推論速度: 90%向上
+  - 本番環境推奨
+
+### 11.3 モデル選択基準
+
+#### エージェント用
+1. **第一選択**: `qwen2.5:7b-instruct-q4_K_M`
+   - 日本語性能が優秀
+   - 指示追従性が高い
+   - メモリ効率が良い
+
+2. **第二選択**: `gemma3:12b`
+   - より複雑な推論が必要な場合
+   - 多言語対応が必要な場合
+
+3. **第三選択**: `gpt-oss:20b`
+   - 創造的な対話が必要な場合
+   - 十分なVRAMがある場合
+
+#### Director用
+1. **推奨**: `gemma3:4b`
+   - 高速判断が可能
+   - 低レイテンシ
+   - 安定した判断
+
+2. **代替**: `qwen2.5:7b-instruct-q4_K_M`
+   - より詳細な分析が必要な場合
+
+### 11.4 インストール方法
+```bash
+# 推奨モデルのインストール
+ollama pull qwen2.5:7b-instruct-q4_K_M
+ollama pull gemma3:12b
+ollama pull gemma3:4b
+ollama pull gpt-oss:20b
+ollama pull qwen:7b
+```
+
+### 11.5 パフォーマンス指標
+
+| モデル | 応答速度 | 日本語品質 | メモリ効率 | 総合評価 |
+|--------|----------|------------|------------|----------|
+| qwen2.5:7b-instruct-q4_K_M | ★★★★☆ | ★★★★★ | ★★★★★ | ★★★★★ |
+| gemma3:12b | ★★★☆☆ | ★★★★☆ | ★★★☆☆ | ★★★★☆ |
+| gpt-oss:20b | ★★☆☆☆ | ★★★★☆ | ★★☆☆☆ | ★★★☆☆ |
+| gemma3:4b | ★★★★★ | ★★★☆☆ | ★★★★★ | ★★★★☆ |
+
+## 12. ライセンスと貢献
+
+MITライセンス
+GitHub: https://github.com/kumaxxp/ollama-streamlit-three
 
 ---
-作成日: 2024年
-バージョン: 1.0.0
+更新日: 2024年12月
+バージョン: 2.0.0
+主要改善: Director自発的判断、一般人キャラクター、対話フロー改善

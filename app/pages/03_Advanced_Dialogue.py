@@ -1,511 +1,519 @@
 """
 Advanced Dialogue System - Streamlit UI
-Director制御による高品質対話生成
+自発的なDirector制御と一般人キャラクターによる自然な対話
+動的なモデル選択機能付き
 """
 
 import streamlit as st
 import json
-import os
-import sys
+import asyncio
 from datetime import datetime
-from typing import Dict, List, Optional
+import sys
+import os
+from pathlib import Path
+import ollama
 
-# パスを追加（core モジュールをインポートするため）
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# パスの設定
+sys.path.append(str(Path(__file__).parent.parent.parent))
 
-from core.dialogue_manager import DialogueManager
-from core.agent import Agent
-from core.director import Director
+# 必要なモジュールのインポート
+from app.core.dialogue_manager import DialogueManager
+from app.core.agent import Agent
+from app.core.director import AutonomousDirector
 
 # ページ設定
 st.set_page_config(
     page_title="Advanced Dialogue System",
-    page_icon="🎯",
+    page_icon="🎭",
     layout="wide"
 )
 
-# ============ ヘルパー関数 ============
+# タイトルと説明
+st.title("🎭 Advanced Dialogue System")
+st.markdown("""
+**自然な対話生成システム**  
+一般的なキャラクター（高校生、会社員、主婦など）による議論を、
+Director AIが自発的に監督・改善します。
+""")
 
-def load_characters() -> Dict:
-    """利用可能なキャラクターを読み込み"""
-    try:
-        with open("config/characters.json", "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        st.error(f"キャラクター設定の読み込みエラー: {e}")
-        return {}
-
-def get_available_models():
-    """利用可能なモデルを取得"""
-    try:
-        import ollama
-        models_response = ollama.list()
-        available_models = []
-        
-        if hasattr(models_response, 'models'):
-            for model in models_response.models:
-                if hasattr(model, 'model'):
-                    available_models.append(model.model)
-                elif hasattr(model, 'name'):
-                    available_models.append(model.name)
-        elif isinstance(models_response, dict) and 'models' in models_response:
-            for model in models_response['models']:
-                if isinstance(model, dict) and 'name' in model:
-                    available_models.append(model['name'])
-                    
-        if not available_models:
-            available_models = ["qwen2.5:7b", "gemma3:4b", "llama3.2:3b"]
-            
-        return available_models
-    except Exception as e:
-        st.warning(f"モデル取得エラー: {e}")
-        return ["qwen2.5:7b", "gemma3:4b"]
-
-def format_quality_score(score: Dict) -> str:
-    """品質スコアをフォーマット"""
-    overall = score.get("overall_score", 0)
-    if overall >= 8:
-        color = "green"
-        emoji = "🌟"
-    elif overall >= 6:
-        color = "orange"
-        emoji = "✨"
-    else:
-        color = "red"
-        emoji = "⚠️"
-    
-    return f":{color}[{emoji} {overall:.1f}/10]"
-
-def display_dialogue_turn(turn_data: Dict):
-    """対話ターンを表示"""
-    for exchange in turn_data.get("exchanges", []):
-        speaker = exchange["speaker"]
-        content = exchange["content"]
-        instruction = exchange.get("instruction", "")
-        
-        # 話者に応じたアバター
-        avatar = "🎭" if "agent1" in speaker.lower() else "🔬"
-        
-        with st.chat_message("assistant", avatar=avatar):
-            st.markdown(f"**{speaker}**")
-            st.write(content)
-            
-            # Director指示を表示（デバッグモード時）
-            if st.session_state.get("show_director_instructions", False):
-                with st.expander("Director指示", expanded=False):
-                    st.caption(f"📝 {instruction}")
-
-# ============ メインUI ============
-
-st.title("🎯 Advanced Dialogue System")
-st.caption("Director AIが管理する高品質対話生成システム")
+# セッション状態の初期化
+if 'dialogue_manager' not in st.session_state:
+    st.session_state.dialogue_manager = None
+if 'dialogue_history' not in st.session_state:
+    st.session_state.dialogue_history = []
+if 'is_running' not in st.session_state:
+    st.session_state.is_running = False
+if 'current_turn' not in st.session_state:
+    st.session_state.current_turn = 0
 
 # サイドバー設定
 with st.sidebar:
-    st.header("⚙️ 設定")
+    st.header("⚙️ 対話設定")
+    
+    # テーマ選択
+    st.subheader("📝 議論テーマ")
+    theme_options = [
+        "AIと人間の共存について",
+        "理想的な教育とは何か",
+        "幸せな人生とは",
+        "環境問題への取り組み",
+        "これからの働き方",
+        "SNSのメリットとデメリット",
+        "お金と幸福の関係",
+        "カスタム（下に入力）"
+    ]
+    selected_theme = st.selectbox("テーマを選択", theme_options)
+    
+    if selected_theme == "カスタム（下に入力）":
+        custom_theme = st.text_input("カスタムテーマ", placeholder="議論したいテーマを入力")
+        theme = custom_theme if custom_theme else "自由討論"
+    else:
+        theme = selected_theme
+    
+    st.divider()
     
     # キャラクター選択
-    characters = load_characters()
-    character_names = list(characters.keys())
+    st.subheader("👥 キャラクター選択")
     
-    if character_names:
-        st.subheader("🎭 キャラクター選択")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            agent1_char = st.selectbox(
-                "エージェント1",
-                character_names,
-                index=0,
-                key="agent1_character"
-            )
-            if agent1_char:
-                st.caption(characters[agent1_char]["personality"]["base"])
-        
-        with col2:
-            agent2_char = st.selectbox(
-                "エージェント2",
-                character_names,
-                index=min(1, len(character_names)-1),
-                key="agent2_character"
-            )
-            if agent2_char:
-                st.caption(characters[agent2_char]["personality"]["base"])
+    # キャラクターオプション
+    character_options = {
+        "high_school_girl_optimistic": "さくら（高校2年生・明るい）",
+        "office_worker_tired": "田中（32歳・営業職）",
+        "college_student_curious": "ユウキ（大学3年生・哲学科）",
+        "housewife_practical": "美咲（28歳・主婦）",
+        "freelancer_creative": "レン（27歳・フリーランス）",
+        "retired_wise": "山田（65歳・元教師）"
+    }
     
-    # モデル選択
-    st.subheader("🤖 モデル設定")
-    available_models = get_available_models()
-    
-    agent_model = st.selectbox(
-        "エージェントモデル",
-        available_models,
-        index=0,
-        key="agent_model"
-    )
-    
-    director_model = st.selectbox(
-        "Directorモデル",
-        available_models,
-        index=0,
-        key="director_model"
-    )
-    
-    # 詳細設定
-    with st.expander("🔧 詳細設定", expanded=False):
-        max_turns = st.slider("最大ターン数", 5, 30, 10, key="max_turns")
-        agent_temp = st.slider("エージェント温度", 0.1, 1.0, 0.7, 0.1)
-        director_temp = st.slider("Director温度", 0.1, 0.7, 0.3, 0.1)
-        
-        st.divider()
-        show_director = st.checkbox(
-            "Director指示を表示",
-            value=False,
-            key="show_director_instructions"
-        )
-        auto_save = st.checkbox("自動保存", value=True)
-
-# メインエリア
-tabs = st.tabs(["🎬 対話生成", "📊 分析", "📚 履歴", "📖 説明"])
-
-# ============ タブ1: 対話生成 ============
-with tabs[0]:
-    # テーマ入力
-    st.subheader("📝 テーマ設定")
-    
-    col1, col2 = st.columns([4, 1])
+    col1, col2 = st.columns(2)
     with col1:
-        preset_themes = [
-            "AIの意識と感情について",
-            "持続可能な社会の実現方法",
-            "教育の未来とテクノロジー",
-            "芸術におけるオリジナリティとは",
-            "人間の自由意志は存在するか",
-            "カスタム（自由入力）"
-        ]
-        
-        selected_preset = st.selectbox("テーマを選択", preset_themes)
-        
-        if selected_preset == "カスタム（自由入力）":
-            theme = st.text_input("テーマを入力", placeholder="議論したいテーマを入力してください")
-        else:
-            theme = selected_preset
+        st.markdown("**キャラクター1**")
+        char1_key = st.selectbox(
+            "選択",
+            list(character_options.keys()),
+            format_func=lambda x: character_options[x],
+            key="char1_select"
+        )
     
     with col2:
-        st.write("")  # スペーサー
-        st.write("")  # スペーサー
-        start_btn = st.button(
-            "🚀 対話開始",
-            type="primary",
-            disabled=not theme or theme == "カスタム（自由入力）",
-            use_container_width=True
+        st.markdown("**キャラクター2**")
+        # char1と異なるデフォルトを設定
+        char2_options = [k for k in character_options.keys() if k != char1_key]
+        if not char2_options:
+            char2_options = list(character_options.keys())
+        
+        char2_key = st.selectbox(
+            "選択",
+            char2_options,
+            format_func=lambda x: character_options[x],
+            key="char2_select"
         )
     
-    # 対話生成処理
-    if start_btn:
-        # セッション状態を初期化
-        st.session_state.dialogue_manager = DialogueManager(
-            theme=theme,
-            agent1_config={
-                "character": st.session_state.agent1_character,
-                "model": st.session_state.agent_model,
-                "temperature": agent_temp
-            },
-            agent2_config={
-                "character": st.session_state.agent2_character,
-                "model": st.session_state.agent_model,
-                "temperature": agent_temp
-            },
-            director_config={
-                "model": st.session_state.director_model,
-                "temperature": director_temp
-            },
-            max_turns=st.session_state.max_turns
-        )
+    # キャラクター詳細表示
+    if st.checkbox("キャラクター詳細を表示"):
+        with st.expander("キャラクター1の詳細"):
+            try:
+                with open('config/characters.json', 'r', encoding='utf-8') as f:
+                    characters = json.load(f)
+                char1_info = characters['characters'].get(char1_key, {})
+                st.json(char1_info)
+            except:
+                st.error("キャラクター情報を読み込めません")
         
-        st.session_state.dialogue_history = []
-        st.session_state.turn_results = []
+        with st.expander("キャラクター2の詳細"):
+            try:
+                with open('config/characters.json', 'r', encoding='utf-8') as f:
+                    characters = json.load(f)
+                char2_info = characters['characters'].get(char2_key, {})
+                st.json(char2_info)
+            except:
+                st.error("キャラクター情報を読み込めません")
+    
+    st.divider()
+    
+    # 詳細設定
+    st.subheader("🎛️ 詳細設定")
+    
+    with st.expander("パラメータ設定", expanded=False):
+        max_turns = st.slider("最大ターン数", 5, 30, 20)
         
-        # プログレスバー
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+        st.markdown("**モデル設定**")
         
-        # 対話コンテナ
-        dialogue_container = st.container()
-        
-        # 対話生成ループ
-        for turn in range(st.session_state.max_turns):
-            progress = (turn + 1) / st.session_state.max_turns
-            progress_bar.progress(progress)
-            
-            # ストリーミング対話生成
-            current_speaker = None
-            current_message = ""
-            message_placeholder = None
-            
-            for event in st.session_state.dialogue_manager.run_turn_streaming(
-                first_speaker="agent1" if turn % 2 == 0 else "agent2"
-            ):
-                event_type = event.get("type")
+        # Ollamaから利用可能なモデルを動的に取得
+        @st.cache_data(ttl=300)  # 5分間キャッシュ
+        def get_available_models():
+            """Ollamaで利用可能なモデル一覧を取得"""
+            try:
+                client = ollama.Client()
+                models_list = client.list()
                 
-                if event_type == "status":
-                    status_text.text(event["message"])
+                # モデル名を抽出
+                model_names = []
+                for model in models_list.get('models', []):
+                    model_name = model.get('name', '')
+                    if model_name:
+                        model_names.append(model_name)
+                
+                # 推奨モデル（具体的な量子化版を優先）
+                priority_models = [
+                    # 最優先：本番環境推奨モデル
+                    "qwen2.5:7b-instruct-q4_K_M",
+                    "gemma3:12b",
+                    "gpt-oss:20b",
+                    "gemma3:4b",
+                    "qwen:7b",
                     
-                elif event_type == "analysis":
-                    # Director分析結果（デバッグ用）
-                    if st.session_state.show_director_instructions:
-                        with dialogue_container:
-                            with st.expander("🔍 Director分析", expanded=False):
-                                st.json(event["data"])
-                                
-                elif event_type == "response_chunk":
-                    # ストリーミング応答
-                    speaker = event["speaker"]
-                    chunk = event["content"]
-                    
-                    if speaker != current_speaker:
-                        # 新しい話者
-                        current_speaker = speaker
-                        current_message = chunk
-                        
-                        avatar = "🎭" if "agent1" in speaker.lower() else "🔬"
-                        with dialogue_container:
-                            with st.chat_message("assistant", avatar=avatar):
-                                st.markdown(f"**{speaker}**")
-                                message_placeholder = st.empty()
-                                message_placeholder.write(current_message)
-                    else:
-                        # 既存メッセージに追加
-                        current_message += chunk
-                        if message_placeholder:
-                            message_placeholder.write(current_message)
-                            
-                elif event_type == "response_complete":
-                    # 応答完了
-                    st.session_state.dialogue_history.append({
-                        "speaker": event["speaker"],
-                        "content": event["content"]
-                    })
-                    
-                elif event_type == "phase_transition":
-                    # フェーズ移行
-                    with dialogue_container:
-                        st.info(f"📊 フェーズ移行: {event['new_phase']}")
-                        
-                elif event_type == "turn_complete":
-                    # ターン完了
-                    pass
+                    # その他の推奨モデル
+                    "qwen2.5:7b-instruct-q5_K_M",
+                    "qwen2.5:7b-instruct",
+                    "qwen2.5:14b-instruct-q4_K_M",
+                    "gemma2:9b",
+                    "llama3.2:3b",
+                    "llama3.1:8b"
+                ]
+                
+                # 優先モデルで利用可能なものを先頭に
+                available_priority = []
+                for model in priority_models:
+                    if model in model_names:
+                        available_priority.append(model)
+                
+                # その他のモデル
+                other_models = sorted([m for m in model_names if m not in priority_models])
+                
+                final_list = available_priority + other_models
+                
+                if not final_list:
+                    # モデルが見つからない場合のデフォルト
+                    final_list = [
+                        "qwen2.5:7b-instruct-q4_K_M",
+                        "gemma3:12b",
+                        "gemma3:4b"
+                    ]
+                    st.warning("⚠️ Ollamaモデルを取得できませんでした。推奨モデルをインストールしてください。")
+                
+                return final_list
+                
+            except Exception as e:
+                st.warning(f"⚠️ モデル一覧の取得に失敗: {str(e)}")
+                # エラー時のフォールバック（本番推奨モデル）
+                return [
+                    "qwen2.5:7b-instruct-q4_K_M",
+                    "gemma3:12b",
+                    "gpt-oss:20b",
+                    "gemma3:4b",
+                    "qwen:7b"
+                ]
+        
+        # モデル一覧を取得
+        model_options = get_available_models()
+        
+        # モデル選択UI
+        col_model1, col_model2 = st.columns(2)
+        
+        with col_model1:
+            # エージェント用モデル選択
+            agent_model = st.selectbox(
+                "エージェントモデル",
+                model_options,
+                index=0,
+                help="対話エージェントが使用するモデル（推奨: qwen2.5:7b-instruct-q4_K_M）"
+            )
             
-            # 中断チェック
-            if st.button("⏸️ 中断", key=f"stop_btn_{turn}"):
-                st.warning("対話を中断しました")
-                break
+            # モデル推奨情報
+            if agent_model == "qwen2.5:7b-instruct-q4_K_M":
+                st.success("✅ 推奨モデル（日本語対話に最適）")
+            elif agent_model in ["gemma3:12b", "gpt-oss:20b"]:
+                st.info("✓ 高品質モデル")
+            
+            # カスタムモデル入力オプション
+            use_custom_agent = st.checkbox("カスタムモデル名を入力（エージェント）", key="custom_agent")
+            if use_custom_agent:
+                agent_model = st.text_input(
+                    "モデル名を入力",
+                    placeholder="例: qwen2.5:7b-instruct-q4_K_M",
+                    key="custom_agent_input"
+                ) or agent_model
         
-        progress_bar.progress(1.0)
-        status_text.text("✅ 対話生成完了！")
+        with col_model2:
+            # Director用モデル選択
+            director_model = st.selectbox(
+                "Directorモデル",
+                model_options,
+                index=min(3, len(model_options)-1),  # gemma3:4bを優先
+                help="監督AIが使用するモデル（推奨: gemma3:4b - 軽量で高速）"
+            )
+            
+            # モデル推奨情報
+            if director_model == "gemma3:4b":
+                st.success("✅ Director推奨モデル（高速判断）")
+            elif director_model == "qwen2.5:7b-instruct-q4_K_M":
+                st.info("✓ 代替推奨モデル")
+            
+            # カスタムモデル入力オプション
+            use_custom_director = st.checkbox("カスタムモデル名を入力（Director）", key="custom_director")
+            if use_custom_director:
+                director_model = st.text_input(
+                    "モデル名を入力",
+                    placeholder="例: gemma3:4b",
+                    key="custom_director_input"
+                ) or director_model
         
-        # 自動保存
-        if auto_save and st.session_state.dialogue_manager:
-            filepath = st.session_state.dialogue_manager.save_dialogue()
-            st.success(f"💾 自動保存完了: {filepath}")
+        # モデル情報表示
+        if st.checkbox("モデル情報を表示"):
+            col_info1, col_info2 = st.columns(2)
+            with col_info1:
+                st.info(f"**エージェント**: {agent_model}")
+                try:
+                    client = ollama.Client()
+                    info = client.show(agent_model)
+                    st.json({
+                        "parameters": info.get("details", {}).get("parameter_size", "不明"),
+                        "quantization": info.get("details", {}).get("quantization_level", "不明")
+                    })
+                except:
+                    st.text("詳細情報を取得できません")
+            
+            with col_info2:
+                st.info(f"**Director**: {director_model}")
+                try:
+                    client = ollama.Client()
+                    info = client.show(director_model)
+                    st.json({
+                        "parameters": info.get("details", {}).get("parameter_size", "不明"),
+                        "quantization": info.get("details", {}).get("quantization_level", "不明")
+                    })
+                except:
+                    st.text("詳細情報を取得できません")
         
-        # 手動保存ボタン
-        col1, col2, col3 = st.columns([1, 1, 3])
-        with col1:
-            if st.button("💾 保存", key="save_final"):
-                if st.session_state.dialogue_manager:
-                    filepath = st.session_state.dialogue_manager.save_dialogue()
-                    st.success(f"保存完了: {filepath}")
+        st.markdown("**温度設定**")
+        col_temp1, col_temp2 = st.columns(2)
+        with col_temp1:
+            agent_temp = st.slider(
+                "エージェント温度",
+                0.1, 1.0, 0.7, 0.1,
+                help="高いほど創造的、低いほど一貫性重視"
+            )
+        with col_temp2:
+            director_temp = st.slider(
+                "Director温度",
+                0.1, 1.0, 0.3, 0.1,
+                help="低めを推奨（判断の一貫性のため）"
+            )
         
-        with col2:
-            if st.button("🔄 新規対話", key="new_dialogue"):
-                st.rerun()
-
-# ============ タブ2: 分析 ============
-with tabs[1]:
-    st.subheader("📊 対話分析")
+        enable_director = st.checkbox("Director介入を有効化", value=True)
+        
+        # モデル再読み込みボタン
+        if st.button("🔄 モデル一覧を更新"):
+            st.cache_data.clear()
+            st.success("モデル一覧を更新しました")
+            st.rerun()
     
-    if "dialogue_manager" in st.session_state and st.session_state.dialogue_manager:
-        dm = st.session_state.dialogue_manager
-        summary = dm.get_summary()
-        
-        # 基本統計
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("総ターン数", summary.get("total_turns", 0))
-        with col2:
-            st.metric("最終フェーズ", summary.get("final_phase", ""))
-        with col3:
-            st.metric("総発言数", summary.get("dialogue_length", 0))
-        with col4:
-            director_stats = summary.get("director_statistics", {})
-            st.metric("平均深度", f"{director_stats.get('average_depth', 0):.1f}")
-        
-        # Director統計
-        st.divider()
-        st.subheader("🎯 Director統計")
-        
-        if director_stats:
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("総介入回数", director_stats.get("total_interventions", 0))
-            with col2:
-                st.metric("平均生産性", f"{director_stats.get('average_productivity', 0):.2f}")
-            with col3:
-                st.metric("分析回数", director_stats.get("analysis_count", 0))
-        
-        # フェーズ分析
-        st.divider()
-        st.subheader("📈 フェーズ進行")
-        
-        phase_turns = summary.get("phase_turns", {})
-        if phase_turns:
-            st.bar_chart(phase_turns)
-        
-        # エージェント情報
-        st.divider()
-        st.subheader("🎭 エージェント情報")
+    st.divider()
+    
+    # Director統計
+    if st.session_state.dialogue_manager:
+        st.subheader("📊 Director統計")
+        stats = st.session_state.dialogue_manager.director.get_intervention_stats()
         
         col1, col2 = st.columns(2)
         with col1:
-            agent1_info = summary.get("agent1", {})
-            st.write(f"**{agent1_info.get('name', '')}**")
-            st.caption(f"タイプ: {agent1_info.get('type', '')}")
-            st.caption(f"発言数: {agent1_info.get('response_count', 0)}")
-        
+            st.metric("総介入回数", stats.get('total', 0))
         with col2:
-            agent2_info = summary.get("agent2", {})
-            st.write(f"**{agent2_info.get('name', '')}**")
-            st.caption(f"タイプ: {agent2_info.get('type', '')}")
-            st.caption(f"発言数: {agent2_info.get('response_count', 0)}")
+            st.metric("現在ターン", st.session_state.current_turn)
         
-    else:
-        st.info("対話を生成すると分析結果が表示されます")
+        if stats.get('by_type'):
+            st.markdown("**介入タイプ別**")
+            for itype, count in stats['by_type'].items():
+                st.text(f"{itype}: {count}回")
 
-# ============ タブ3: 履歴 ============
-with tabs[2]:
-    st.subheader("📚 保存済み対話")
+# メインエリア
+col_main, col_stats = st.columns([3, 1])
+
+with col_main:
+    # 対話表示エリア
+    dialogue_container = st.container()
     
-    dialogue_dir = os.path.join("data", "dialogues")
+    # コントロールボタン
+    col_btn1, col_btn2, col_btn3 = st.columns(3)
     
-    if os.path.exists(dialogue_dir):
-        files = sorted(
-            [f for f in os.listdir(dialogue_dir) if f.endswith(".json")],
-            reverse=True
-        )
-        
-        if files:
-            selected_file = st.selectbox("履歴を選択", files)
+    with col_btn1:
+        if st.button("🎬 対話を開始", disabled=st.session_state.is_running):
+            # DialogueManagerの初期化
+            client = ollama.Client()
+            st.session_state.dialogue_manager = DialogueManager(client, director_model)
             
-            if st.button("📂 読み込み", key="load_history"):
-                try:
-                    filepath = os.path.join(dialogue_dir, selected_file)
-                    with open(filepath, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    
-                    # 基本情報表示
-                    st.write(f"**テーマ**: {data.get('theme', '')}")
-                    st.write(f"**生成日時**: {data.get('timestamp', '')}")
-                    st.write(f"**総ターン数**: {data.get('total_turns', 0)}")
-                    
-                    # エージェント情報
-                    agents = data.get("agents", {})
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        agent1 = agents.get("agent1", {})
-                        st.write(f"**Agent 1**: {agent1.get('name', '')}")
-                    with col2:
-                        agent2 = agents.get("agent2", {})
-                        st.write(f"**Agent 2**: {agent2.get('name', '')}")
-                    
-                    st.divider()
-                    
-                    # 対話内容表示
-                    for item in data.get("dialogue_history", []):
-                        role = item.get("name", item.get("role", ""))
-                        content = item.get("content", "")
-                        phase = item.get("phase", "")
-                        
-                        avatar = "🎭" if "agent1" in item.get("role", "") else "🔬"
-                        
-                        with st.chat_message("assistant", avatar=avatar):
-                            st.markdown(f"**{role}** ({phase})")
-                            st.write(content)
-                    
-                except Exception as e:
-                    st.error(f"読み込みエラー: {e}")
-        else:
-            st.info("保存済みの対話がありません")
-    else:
-        st.info("まだ対話が保存されていません")
-        os.makedirs(dialogue_dir, exist_ok=True)
+            # エージェント設定
+            agent1_config = {
+                'character_type': char1_key,
+                'model': agent_model,
+                'temperature': agent_temp
+            }
+            agent2_config = {
+                'character_type': char2_key,
+                'model': agent_model,
+                'temperature': agent_temp
+            }
+            
+            # 初期化
+            st.session_state.dialogue_manager.initialize(
+                theme, 
+                agent1_config, 
+                agent2_config
+            )
+            st.session_state.dialogue_manager.enable_director = enable_director
+            st.session_state.dialogue_manager.max_turns = max_turns
+            
+            st.session_state.dialogue_history = []
+            st.session_state.is_running = True
+            st.session_state.current_turn = 0
+            
+            st.success("対話を開始しました！")
+            st.rerun()
+    
+    with col_btn2:
+        if st.button("⏸️ 一時停止", disabled=not st.session_state.is_running):
+            st.session_state.is_running = False
+            if st.session_state.dialogue_manager:
+                st.session_state.dialogue_manager.stop_dialogue()
+            st.info("対話を一時停止しました")
+    
+    with col_btn3:
+        if st.button("🔄 リセット"):
+            st.session_state.dialogue_manager = None
+            st.session_state.dialogue_history = []
+            st.session_state.is_running = False
+            st.session_state.current_turn = 0
+            st.info("リセットしました")
+            st.rerun()
 
-# ============ タブ4: 説明 ============
-with tabs[3]:
-    st.subheader("📖 システム説明")
+# 対話実行
+async def run_dialogue_async():
+    """非同期で対話を実行"""
+    manager = st.session_state.dialogue_manager
     
-    st.markdown("""
-    ### 🎯 Advanced Dialogue System とは
+    while st.session_state.is_running and st.session_state.current_turn < max_turns:
+        try:
+            # 1ターン実行
+            turn_result = await manager.run_turn()
+            st.session_state.current_turn += 1
+            st.session_state.dialogue_history.append(turn_result)
+            
+            # 表示更新
+            display_dialogue_turn(turn_result)
+            
+            # Director介入があれば表示
+            if 'director_intervention' in turn_result:
+                intervention = turn_result['director_intervention']
+                st.info(f"🎬 **Director介入**: {intervention['reason']}")
+                st.write(f"_{intervention['message']}_")
+            
+            # 少し待機
+            await asyncio.sleep(1)
+            
+        except Exception as e:
+            st.error(f"エラーが発生しました: {e}")
+            st.session_state.is_running = False
+            break
     
-    Director AI（監督AI）が2つのエージェントの対話を管理し、議論の質を向上させるシステムです。
+    st.session_state.is_running = False
+    st.success("対話が完了しました！")
+
+def display_dialogue_turn(turn_data):
+    """対話ターンを表示"""
+    with dialogue_container:
+        speaker = turn_data.get('speaker', '不明')
+        listener = turn_data.get('listener', '相手')
+        message = turn_data.get('message', '')
+        turn_num = turn_data.get('turn', 0)
+        
+        # スピーカーによって色を変える
+        if speaker == "Director":
+            st.info(f"🎬 **Director** → {listener}")
+            st.write(message)
+        else:
+            # キャラクターアイコンを設定
+            icon = "👤"
+            if "高校" in speaker:
+                icon = "👧"
+            elif "営業" in speaker or "会社" in speaker:
+                icon = "👔"
+            elif "大学" in speaker:
+                icon = "📚"
+            elif "主婦" in speaker:
+                icon = "👩"
+            elif "フリー" in speaker:
+                icon = "💻"
+            elif "教師" in speaker or "先生" in speaker:
+                icon = "👨‍🏫"
+            
+            st.markdown(f"**{icon} {speaker}** → {listener} (Turn {turn_num})")
+            st.write(message)
+        
+        st.divider()
+
+# 実行処理
+if st.session_state.is_running and st.session_state.dialogue_manager:
+    # 非同期実行
+    asyncio.run(run_dialogue_async())
+
+# 対話履歴の表示
+with col_stats:
+    st.subheader("📜 対話サマリー")
     
-    #### 主な特徴
+    if st.session_state.dialogue_manager:
+        summary = st.session_state.dialogue_manager.get_summary()
+        
+        st.metric("テーマ", theme[:20] + "...")
+        st.metric("総ターン数", summary.get('total_turns', 0))
+        st.metric("Director介入", summary.get('director_interventions', 0))
+        
+        if summary.get('participants'):
+            st.markdown("**参加者**")
+            for p in summary['participants']:
+                st.text(f"• {p}")
+
+# 対話の保存
+if st.session_state.dialogue_history and len(st.session_state.dialogue_history) > 0:
+    st.divider()
     
-    1. **Director による品質管理**
-       - 毎ターン対話を分析
-       - 最適な戦略を選択
-       - 具体的な指示を生成
+    col_save1, col_save2 = st.columns(2)
     
-    2. **動的なキャラクター設定**
-       - 6種類の個性的なキャラクター
-       - 専門性と性格に基づく応答
-       - 一貫した人格の維持
+    with col_save1:
+        if st.button("💾 対話を保存"):
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"dialogue_{timestamp}.json"
+            filepath = os.path.join("data", "dialogues", filename)
+            
+            # ディレクトリ作成
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            
+            # 保存
+            if st.session_state.dialogue_manager:
+                st.session_state.dialogue_manager.save_dialogue(filepath)
+                st.success(f"対話を保存しました: {filename}")
     
-    3. **戦略的介入**
-       - 議論の深化
-       - 視点転換
-       - 建設的対立
-       - 収束と統合
-    
-    4. **フェーズ管理**
-       - 探索 → 深化 → 収束 → 統合
-       - 自動的なフェーズ移行
-       - フェーズに応じた戦略選択
-    
-    #### 使い方
-    
-    1. サイドバーでキャラクターとモデルを選択
-    2. テーマを入力または選択
-    3. 「対話開始」ボタンをクリック
-    4. 生成された対話を確認
-    5. 必要に応じて保存
-    
-    #### キャラクター一覧
-    
-    - **哲学者ソクラテス**: 問いかけを通じて真理を探求
-    - **科学者ダーウィン**: 観察と証拠に基づく論証
-    - **創造的芸術家**: 直感と感性による独創的視点
-    - **実践的エンジニア**: 問題解決と実装重視
-    - **共感的カウンセラー**: 感情理解と対話促進
-    - **分析的経済学者**: データと理論による分析
-    
-    #### カスタマイズ
-    
-    `config/` フォルダ内のJSONファイルを編集することで、
-    キャラクター、戦略、プロンプトをカスタマイズできます。
-    """)
-    
-    with st.expander("🔧 技術詳細"):
-        st.markdown("""
-        - **言語モデル**: Ollama (Qwen2.5, Gemma3等)
-        - **アーキテクチャ**: 3層構造（UI / Manager / Core）
-        - **設定管理**: JSON外部ファイル
-        - **ストリーミング**: リアルタイム応答表示
-        """)
-    
-    with st.expander("📝 更新履歴"):
-        st.markdown("""
-        - v1.0.0: 初期リリース
-        - Director制御による対話品質管理
-        - 6種類の基本キャラクター実装
-        - 5つの介入戦略実装
-        """)
+    with col_save2:
+        # ダウンロードボタン
+        if st.session_state.dialogue_manager:
+            save_data = {
+                "summary": st.session_state.dialogue_manager.get_summary(),
+                "dialogue": st.session_state.dialogue_history,
+                "director_stats": st.session_state.dialogue_manager.director.get_intervention_stats()
+            }
+            
+            json_str = json.dumps(save_data, ensure_ascii=False, indent=2)
+            st.download_button(
+                label="📥 JSONをダウンロード",
+                data=json_str,
+                file_name=f"dialogue_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json"
+            )
+
+# フッター
+st.divider()
+st.markdown("""
+---
+**Advanced Dialogue System v2.0**  
+Director AIによる自発的な介入と一般人キャラクターによる自然な対話生成
+""")

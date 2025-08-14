@@ -1,522 +1,398 @@
 """
-DialogueManager クラス
-対話全体のオーケストレーションを担当
+Dialogue Manager - 対話フロー全体の管理
+自己対話を防ぎ、必ず交互に発言するよう制御
 """
 
 import json
-import os
+import logging
+from typing import Dict, List, Optional, Tuple
 from datetime import datetime
-from typing import Dict, List, Optional, Any, Tuple, Generator
+import asyncio
+
 from .agent import Agent
-from .director import Director
+from .director import AutonomousDirector
+
+logger = logging.getLogger(__name__)
 
 class DialogueManager:
-    """対話セッション全体を管理"""
+    """
+    対話全体の流れを管理
+    エージェント間の適切な対話を保証
+    """
     
-    def __init__(
-        self,
-        theme: str,
-        agent1_config: Dict,
-        agent2_config: Dict,
-        director_config: Optional[Dict] = None,
-        max_turns: int = 20
-    ):
+    def __init__(self, ollama_client, director_model: str = "qwen2.5:7b"):
+        self.client = ollama_client
+        self.director = AutonomousDirector(ollama_client, director_model)
+        
+        # エージェント管理
+        self.agent1: Optional[Agent] = None
+        self.agent2: Optional[Agent] = None
+        self.current_speaker: Optional[Agent] = None
+        self.current_listener: Optional[Agent] = None
+        
+        # 対話状態
+        self.dialogue_history: List[Dict] = []
+        self.theme = ""
+        self.turn_count = 0
+        self.is_running = False
+        
+        # 設定
+        self.max_turns = 20
+        self.enable_director = True
+        
+    def initialize(self, theme: str, agent1_config: Dict, agent2_config: Dict):
         """
+        対話セッションの初期化
+        
         Args:
-            theme: 議論のテーマ
-            agent1_config: エージェント1の設定 {"character": "...", "model": "...", "temperature": ...}
+            theme: 議論テーマ
+            agent1_config: エージェント1の設定
             agent2_config: エージェント2の設定
-            director_config: Directorの設定 {"model": "...", "temperature": ...}
-            max_turns: 最大ターン数
         """
         self.theme = theme
-        self.max_turns = max_turns
-        self.current_turn = 0
-        self.current_phase = "exploration"
         self.dialogue_history = []
-        self.phase_history = []
+        self.turn_count = 0
         
-        # エージェントを初期化
+        # エージェント作成
         self.agent1 = Agent(
             agent_id="agent1",
-            character_type=agent1_config.get("character", "philosophical_socrates"),
-            model_name=agent1_config.get("model", "qwen2.5:7b"),
-            temperature=agent1_config.get("temperature", 0.7)
+            character_type=agent1_config.get('character_type'),
+            model_name=agent1_config.get('model', 'qwen2.5:7b'),
+            temperature=agent1_config.get('temperature', 0.7),
+            ollama_client=self.client
         )
         
         self.agent2 = Agent(
             agent_id="agent2",
-            character_type=agent2_config.get("character", "scientific_darwin"),
-            model_name=agent2_config.get("model", "qwen2.5:7b"),
-            temperature=agent2_config.get("temperature", 0.7)
+            character_type=agent2_config.get('character_type'),
+            model_name=agent2_config.get('model', 'qwen2.5:7b'),
+            temperature=agent2_config.get('temperature', 0.7),
+            ollama_client=self.client
         )
         
-        # Directorを初期化
-        director_config = director_config or {}
-        self.director = Director(
-            model_name=director_config.get("model", "qwen2.5:7b"),
-            temperature=director_config.get("temperature", 0.3)
-        )
+        # セッションコンテキスト設定
+        self.agent1.set_session_context(theme, "建設的な議論", "exploration")
+        self.agent2.set_session_context(theme, "建設的な議論", "exploration")
         
-        # フェーズ管理
-        self.phases = self._load_phases()
+        # 最初の話者をランダムに決定（または agent1 固定）
+        self.current_speaker = self.agent1
+        self.current_listener = self.agent2
         
-        # セッションコンテキストを設定
-        self._initialize_session()
+        logger.info(f"Dialogue initialized - Theme: {theme}")
+    
+    async def run_turn(self) -> Dict:
+        """
+        1ターンの対話を実行
+        必ず話者と聞き手を交代させる
         
-    def _load_phases(self) -> Dict:
-        """フェーズ設定を読み込み"""
+        Returns:
+            {
+                "speaker": str,
+                "listener": str,
+                "message": str,
+                "director_intervention": Optional[Dict]
+            }
+        """
+        self.turn_count += 1
+        self.director.update_phase(self.turn_count)
+        
+        # 話者と聞き手を明確に設定
+        speaker = self.current_speaker
+        listener = self.current_listener
+        
+        logger.info(f"Turn {self.turn_count}: {speaker.character['name']} → {listener.character['name']}")
+        
+        # 最初のターンの場合、開始指示を生成
+        if self.turn_count == 1:
+            opening_instruction = self.director.generate_opening_instruction(
+                self.theme, 
+                speaker.character['name']
+            )
+            speaker.add_directive(
+                opening_instruction['instruction'],
+                opening_instruction['focus_points']
+            )
+            
+            # 最初の発言を生成
+            message = await self._generate_first_message(speaker)
+        else:
+            # 前の発言への応答を生成
+            last_message = self.dialogue_history[-1]['message'] if self.dialogue_history else ""
+            message = await self._generate_response(speaker, listener, last_message)
+        
+        # 対話履歴に追加
+        turn_data = {
+            "turn": self.turn_count,
+            "speaker": speaker.character['name'],
+            "listener": listener.character['name'],
+            "message": message,
+            "timestamp": datetime.now().isoformat()
+        }
+        self.dialogue_history.append(turn_data)
+        
+        # Director による評価と介入判断
+        director_result = None
+        if self.enable_director and self.turn_count > 1:
+            director_result = await self.director.evaluate_dialogue(self.dialogue_history)
+            
+            if director_result.get("intervention_needed", False):
+                # 介入メッセージを履歴に追加
+                intervention_data = {
+                    "turn": self.turn_count,
+                    "speaker": "Director",
+                    "listener": "両者",
+                    "message": director_result['message'],
+                    "intervention_type": director_result['intervention_type'],
+                    "timestamp": datetime.now().isoformat()
+                }
+                self.dialogue_history.append(intervention_data)
+                
+                # 次の発言者に介入内容を伝える
+                self._apply_director_intervention(listener, director_result)
+        
+        # 話者と聞き手を交代
+        self.current_speaker = listener
+        self.current_listener = speaker
+        
+        # 結果を返す
+        result = turn_data.copy()
+        if director_result and director_result.get("intervention_needed"):
+            result["director_intervention"] = director_result
+        
+        return result
+    
+    async def _generate_first_message(self, speaker: Agent) -> str:
+        """最初の発言を生成"""
+        prompt = f"""
+あなたは{speaker.character['name']}です。
+
+テーマ「{self.theme}」について、最初の発言をしてください。
+
+あなたの性格と背景:
+{json.dumps(speaker.character, ensure_ascii=False, indent=2)}
+
+注意事項:
+- 自然な導入から始めてください
+- あなたらしい視点で話してください
+- 相手がいることを意識した発言にしてください
+"""
+        
         try:
-            config_path = os.path.join("config", "strategies.json")
-            with open(config_path, "r", encoding="utf-8") as f:
-                strategies = json.load(f)
-                return strategies.get("discussion_phases", {})
+            response = self.client.chat(
+                model=speaker.model_name,
+                messages=[
+                    {"role": "system", "content": speaker._build_system_prompt()},
+                    {"role": "user", "content": prompt}
+                ],
+                options={
+                    "temperature": speaker.temperature,
+                    "top_p": 0.95
+                },
+                stream=False
+            )
+            
+            return response['message']['content']
+            
         except Exception as e:
-            print(f"Error loading phases: {e}")
-            return {
-                "exploration": {"name": "探索", "duration_turns": 5}
-            }
+            logger.error(f"First message generation error: {e}")
+            return f"こんにちは。{self.theme}について話しましょう。"
     
-    def _initialize_session(self):
-        """セッションを初期化"""
-        # 現在のフェーズ情報
-        phase_info = self.phases.get(self.current_phase, {})
-        goal = phase_info.get("goal", "建設的な議論")
+    async def _generate_response(self, speaker: Agent, listener: Agent, last_message: str) -> str:
+        """
+        相手の発言への応答を生成
+        必ず相手に向けた発言にする
+        """
+        # 最近の文脈を取得（最新3ターン）
+        recent_context = self._get_recent_context(3)
         
-        # エージェントにコンテキストを設定
-        self.agent1.set_session_context(self.theme, goal, self.current_phase)
-        self.agent2.set_session_context(self.theme, goal, self.current_phase)
+        prompt = f"""
+あなたは{speaker.character['name']}です。
+{listener.character['name']}さんとの対話中です。
+
+これまでの文脈:
+{recent_context}
+
+{listener.character['name']}さんの最新の発言:
+「{last_message}」
+
+この発言に対して、{listener.character['name']}さんに向けて応答してください。
+
+重要な指示:
+- 必ず{listener.character['name']}さんに向けて話してください
+- 自分（{speaker.character['name']}）に話しかけないでください
+- 対話として自然な応答を心がけてください
+- あなたの性格や立場を保ちながら応答してください
+
+あなたの性格設定:
+{json.dumps(speaker.character, ensure_ascii=False, indent=2)}
+"""
         
-        # フェーズ履歴に記録
-        self.phase_history.append({
-            "phase": self.current_phase,
-            "start_turn": 0
-        })
-    
-    def run_turn(self, first_speaker: str = "agent1") -> Dict[str, Any]:
-        """1ターンを実行"""
-        turn_result = {
-            "turn": self.current_turn,
-            "phase": self.current_phase,
-            "exchanges": [],
-            "director_analysis": None,
-            "director_strategy": None,
-            "quality_scores": []
-        }
-        
-        # 対話履歴から最後の発言を取得
-        last_message = ""
-        if self.dialogue_history:
-            last_message = self.dialogue_history[-1]["content"]
-        else:
-            # 初回は開始メッセージ
-            last_message = f"「{self.theme}」について議論を始めましょう。"
-        
-        # Directorが現状を分析
-        if len(self.dialogue_history) > 0:
-            analysis = self.director.analyze_dialogue(
-                self.dialogue_history,
-                self.current_phase
+        try:
+            response = self.client.chat(
+                model=speaker.model_name,
+                messages=[
+                    {"role": "system", "content": speaker._build_system_prompt()},
+                    {"role": "user", "content": prompt}
+                ],
+                options={
+                    "temperature": speaker.temperature,
+                    "top_p": 0.95,
+                    "seed": None  # 多様性のため
+                },
+                stream=False
             )
-            turn_result["director_analysis"] = analysis
             
-            # 戦略を選択し、指示を生成
-            strategy, instruction_data = self.director.select_strategy(
-                analysis,
-                self.current_phase,
-                self.current_turn
-            )
-            turn_result["director_strategy"] = {
-                "strategy": strategy,
-                "instruction": instruction_data
-            }
-        else:
-            # 初回はデフォルト指示
-            instruction_data = {
-                "instruction": "テーマについて、あなたの専門性を活かして論点を提示してください",
-                "attention_points": ["明確な立場を示す", "具体的に述べる"],
-                "expected_outcome": "議論の出発点を作る"
-            }
-            turn_result["director_strategy"] = {
-                "strategy": "exploration",
-                "instruction": instruction_data
-            }
-        
-        # 話者を決定
-        if first_speaker == "agent1":
-            current_agent = self.agent1
-            opponent_agent = self.agent2
-        else:
-            current_agent = self.agent2
-            opponent_agent = self.agent1
-        
-        # エージェント1の発言
-        current_agent.add_directive(
-            instruction_data["instruction"],
-            instruction_data.get("attention_points", [])
-        )
-        
-        response1 = current_agent.generate_response(last_message)
-        
-        # 対話履歴に追加
-        self.dialogue_history.append({
-            "role": current_agent.agent_id,
-            "name": current_agent.get_character_info()["name"],
-            "content": response1,
-            "turn": self.current_turn,
-            "phase": self.current_phase
-        })
-        
-        # 相手エージェントのメモリにも追加
-        opponent_agent.add_to_memory(current_agent.agent_id, response1)
-        
-        # 品質評価
-        quality1 = self.director.evaluate_response(
-            response1,
-            instruction_data["instruction"],
-            current_agent.get_character_info()
-        )
-        turn_result["quality_scores"].append(quality1)
-        
-        # エージェント2の応答
-        # 新しい分析と指示
-        analysis2 = self.director.analyze_dialogue(
-            self.dialogue_history,
-            self.current_phase
-        )
-        strategy2, instruction_data2 = self.director.select_strategy(
-            analysis2,
-            self.current_phase,
-            self.current_turn
-        )
-        
-        opponent_agent.add_directive(
-            instruction_data2["instruction"],
-            instruction_data2.get("attention_points", [])
-        )
-        
-        response2 = opponent_agent.generate_response(response1)
-        
-        # 対話履歴に追加
-        self.dialogue_history.append({
-            "role": opponent_agent.agent_id,
-            "name": opponent_agent.get_character_info()["name"],
-            "content": response2,
-            "turn": self.current_turn,
-            "phase": self.current_phase
-        })
-        
-        # 相手エージェントのメモリにも追加
-        current_agent.add_to_memory(opponent_agent.agent_id, response2)
-        
-        # 品質評価
-        quality2 = self.director.evaluate_response(
-            response2,
-            instruction_data2["instruction"],
-            opponent_agent.get_character_info()
-        )
-        turn_result["quality_scores"].append(quality2)
-        
-        # ターン結果に追加
-        turn_result["exchanges"] = [
-            {
-                "speaker": current_agent.get_character_info()["name"],
-                "content": response1,
-                "instruction": instruction_data["instruction"]
-            },
-            {
-                "speaker": opponent_agent.get_character_info()["name"],
-                "content": response2,
-                "instruction": instruction_data2["instruction"]
-            }
-        ]
-        
-        # フェーズ移行チェック
-        next_phase = self.director.get_phase_transition_recommendation(
-            self.current_phase,
-            self.current_turn,
-            analysis2
-        )
-        if next_phase and next_phase != self.current_phase:
-            self._transition_phase(next_phase)
-            turn_result["phase_transition"] = next_phase
-        
-        self.current_turn += 1
-        
-        return turn_result
-    
-    def run_turn_streaming(
-        self,
-        first_speaker: str = "agent1"
-    ) -> Generator[Dict[str, Any], None, None]:
-        """1ターンをストリーミングで実行（UIでの使用）"""
-        
-        # 分析フェーズ
-        yield {"type": "status", "message": "Director が対話を分析中..."}
-        
-        # 対話履歴から最後の発言を取得
-        last_message = ""
-        if self.dialogue_history:
-            last_message = self.dialogue_history[-1]["content"]
-        else:
-            last_message = f"「{self.theme}」について議論を始めましょう。"
-        
-        # Director分析
-        analysis = None
-        if len(self.dialogue_history) > 0:
-            analysis = self.director.analyze_dialogue(
-                self.dialogue_history,
-                self.current_phase
-            )
-            yield {"type": "analysis", "data": analysis}
-        
-        # 戦略選択
-        yield {"type": "status", "message": "戦略を選択中..."}
-        
-        if analysis:
-            strategy, instruction_data = self.director.select_strategy(
-                analysis,
-                self.current_phase,
-                self.current_turn
-            )
-        else:
-            instruction_data = {
-                "instruction": "テーマについて、あなたの専門性を活かして論点を提示してください",
-                "attention_points": ["明確な立場を示す"],
-                "expected_outcome": "議論の出発点を作る"
-            }
-            strategy = "exploration"
-        
-        yield {"type": "strategy", "data": {"strategy": strategy, "instruction": instruction_data}}
-        
-        # エージェント選択
-        if first_speaker == "agent1":
-            current_agent = self.agent1
-            opponent_agent = self.agent2
-        else:
-            current_agent = self.agent2
-            opponent_agent = self.agent1
-        
-        # エージェント1の発言
-        yield {
-            "type": "status",
-            "message": f"{current_agent.get_character_info()['name']} が発言を準備中..."
-        }
-        
-        current_agent.add_directive(
-            instruction_data["instruction"],
-            instruction_data.get("attention_points", [])
-        )
-        
-        # ストリーミング応答
-        response1 = ""
-        for chunk in current_agent.generate_response(last_message, stream=True):
-            response1 += chunk
-            yield {
-                "type": "response_chunk",
-                "speaker": current_agent.get_character_info()["name"],
-                "content": chunk
-            }
-        
-        # 完了通知
-        yield {
-            "type": "response_complete",
-            "speaker": current_agent.get_character_info()["name"],
-            "content": response1
-        }
-        
-        # 履歴更新
-        self.dialogue_history.append({
-            "role": current_agent.agent_id,
-            "name": current_agent.get_character_info()["name"],
-            "content": response1,
-            "turn": self.current_turn,
-            "phase": self.current_phase
-        })
-        opponent_agent.add_to_memory(current_agent.agent_id, response1)
-        
-        # エージェント2の準備
-        yield {
-            "type": "status",
-            "message": f"{opponent_agent.get_character_info()['name']} が応答を準備中..."
-        }
-        
-        # 新しい指示を生成
-        analysis2 = self.director.analyze_dialogue(
-            self.dialogue_history,
-            self.current_phase
-        )
-        strategy2, instruction_data2 = self.director.select_strategy(
-            analysis2,
-            self.current_phase,
-            self.current_turn
-        )
-        
-        opponent_agent.add_directive(
-            instruction_data2["instruction"],
-            instruction_data2.get("attention_points", [])
-        )
-        
-        # ストリーミング応答
-        response2 = ""
-        for chunk in opponent_agent.generate_response(response1, stream=True):
-            response2 += chunk
-            yield {
-                "type": "response_chunk",
-                "speaker": opponent_agent.get_character_info()["name"],
-                "content": chunk
-            }
-        
-        # 完了通知
-        yield {
-            "type": "response_complete",
-            "speaker": opponent_agent.get_character_info()["name"],
-            "content": response2
-        }
-        
-        # 履歴更新
-        self.dialogue_history.append({
-            "role": opponent_agent.agent_id,
-            "name": opponent_agent.get_character_info()["name"],
-            "content": response2,
-            "turn": self.current_turn,
-            "phase": self.current_phase
-        })
-        current_agent.add_to_memory(opponent_agent.agent_id, response2)
-        
-        # フェーズ移行チェック
-        next_phase = self.director.get_phase_transition_recommendation(
-            self.current_phase,
-            self.current_turn,
-            analysis2
-        )
-        
-        if next_phase and next_phase != self.current_phase:
-            self._transition_phase(next_phase)
-            yield {"type": "phase_transition", "new_phase": next_phase}
-        
-        self.current_turn += 1
-        
-        # ターン完了
-        yield {"type": "turn_complete", "turn": self.current_turn}
-    
-    def _transition_phase(self, new_phase: str):
-        """フェーズを移行"""
-        self.current_phase = new_phase
-        phase_info = self.phases.get(new_phase, {})
-        goal = phase_info.get("goal", "建設的な議論")
-        
-        # エージェントに通知
-        self.agent1.set_session_context(self.theme, goal, new_phase)
-        self.agent2.set_session_context(self.theme, goal, new_phase)
-        
-        # 履歴に記録
-        self.phase_history.append({
-            "phase": new_phase,
-            "start_turn": self.current_turn
-        })
-    
-    def run_dialogue(self) -> List[Dict]:
-        """対話全体を実行"""
-        results = []
-        
-        while self.current_turn < self.max_turns:
-            # ターンごとに話者を交代
-            first_speaker = "agent1" if self.current_turn % 2 == 0 else "agent2"
-            turn_result = self.run_turn(first_speaker)
-            results.append(turn_result)
+            generated_message = response['message']['content']
             
-            # 強制終了条件チェック
-            if self._should_end_dialogue(turn_result):
-                break
-        
-        return results
+            # 自己言及チェック（念のため）
+            if self._is_self_reference(generated_message, speaker.character['name']):
+                logger.warning(f"Self-reference detected, regenerating...")
+                # 再生成を試みる
+                return await self._generate_response(speaker, listener, last_message)
+            
+            return generated_message
+            
+        except Exception as e:
+            logger.error(f"Response generation error: {e}")
+            return f"{listener.character['name']}さん、それは興味深い視点ですね。"
     
-    def _should_end_dialogue(self, turn_result: Dict) -> bool:
-        """対話を終了すべきか判定"""
-        # 品質が極端に低い場合
-        if turn_result.get("quality_scores"):
-            avg_quality = sum(
-                s.get("overall_score", 0) for s in turn_result["quality_scores"]
-            ) / len(turn_result["quality_scores"])
-            if avg_quality < 3:
-                return True
+    def _get_recent_context(self, num_turns: int = 3) -> str:
+        """最近の対話文脈を取得"""
+        if not self.dialogue_history:
+            return "（これが最初の発言です）"
         
-        # 同じ内容の繰り返し（最後の4発言をチェック）
-        if len(self.dialogue_history) >= 4:
-            recent = self.dialogue_history[-4:]
-            contents = [d["content"][:50] for d in recent]
-            if len(set(contents)) == 1:
-                return True
+        recent = self.dialogue_history[-num_turns:]
+        context_lines = []
+        
+        for entry in recent:
+            speaker = entry.get('speaker')
+            listener = entry.get('listener', '')
+            message = entry.get('message', '')
+            
+            if speaker == 'Director':
+                context_lines.append(f"[監督からの介入] {message}")
+            else:
+                if listener:
+                    context_lines.append(f"{speaker} → {listener}: 「{message}」")
+                else:
+                    context_lines.append(f"{speaker}: 「{message}」")
+        
+        return "\n".join(context_lines)
+    
+    def _is_self_reference(self, message: str, speaker_name: str) -> bool:
+        """
+        自己言及をチェック
+        （例：「私、太郎は太郎に言います」のような不自然な発言を検出）
+        """
+        # 簡易的なチェック
+        if f"{speaker_name}に" in message and f"私は{speaker_name}" in message:
+            return True
+        if f"{speaker_name}さんに" in message and f"私、{speaker_name}" in message:
+            return True
         
         return False
     
-    def save_dialogue(self, filename: Optional[str] = None) -> str:
-        """対話を保存"""
-        if not filename:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"dialogue_{timestamp}.json"
+    def _apply_director_intervention(self, next_speaker: Agent, intervention: Dict):
+        """Director の介入を次の発言者に適用"""
+        instruction = intervention.get('message', '')
+        intervention_type = intervention.get('intervention_type', '')
         
-        save_dir = os.path.join("data", "dialogues")
-        os.makedirs(save_dir, exist_ok=True)
+        # 介入タイプに応じた指示を生成
+        if intervention_type == "質問投げかけ":
+            next_speaker.add_directive(
+                f"Directorからの質問を考慮してください: {instruction}",
+                ["新しい視点を提供", "質問に答える"]
+            )
+        elif intervention_type == "要約":
+            next_speaker.add_directive(
+                "これまでの議論を踏まえて、発展的な意見を述べてください",
+                ["要約を活用", "次のステップを提案"]
+            )
+        elif intervention_type == "方向転換":
+            next_speaker.add_directive(
+                instruction,
+                ["新しい角度から", "視点を変えて"]
+            )
+        elif intervention_type == "深掘り":
+            next_speaker.add_directive(
+                f"この点を深く掘り下げてください: {instruction}",
+                ["具体例を挙げる", "詳細に説明"]
+            )
+    
+    async def run_dialogue(self, max_turns: Optional[int] = None) -> List[Dict]:
+        """
+        対話全体を実行
         
-        filepath = os.path.join(save_dir, filename)
+        Args:
+            max_turns: 最大ターン数（Noneの場合はデフォルト値）
         
-        # 保存データを構築
-        save_data = {
-            "theme": self.theme,
-            "agents": {
-                "agent1": self.agent1.get_character_info(),
-                "agent2": self.agent2.get_character_info()
-            },
-            "dialogue_history": self.dialogue_history,
-            "phase_history": self.phase_history,
-            "director_statistics": self.director.get_statistics(),
-            "total_turns": self.current_turn,
-            "timestamp": datetime.now().isoformat()
-        }
+        Returns:
+            対話履歴
+        """
+        if max_turns:
+            self.max_turns = max_turns
         
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(save_data, f, ensure_ascii=False, indent=2)
+        self.is_running = True
         
-        return filepath
+        try:
+            while self.turn_count < self.max_turns and self.is_running:
+                # 1ターン実行
+                turn_result = await self.run_turn()
+                
+                # 終了判断
+                if self.turn_count >= 10:  # 最低10ターン後
+                    should_end, reason = self.director.should_end_dialogue(
+                        self.dialogue_history, 
+                        self.turn_count
+                    )
+                    if should_end:
+                        logger.info(f"Dialogue ended by Director: {reason}")
+                        break
+                
+                # 少し待機（API負荷軽減）
+                await asyncio.sleep(0.5)
+            
+        except Exception as e:
+            logger.error(f"Dialogue execution error: {e}")
+        finally:
+            self.is_running = False
+        
+        return self.dialogue_history
+    
+    def stop_dialogue(self):
+        """対話を停止"""
+        self.is_running = False
+        logger.info("Dialogue stop requested")
     
     def get_summary(self) -> Dict:
         """対話のサマリーを取得"""
         if not self.dialogue_history:
-            return {}
-        
-        # Director統計
-        director_stats = self.director.get_statistics()
-        
-        # フェーズごとのターン数
-        phase_turns = {}
-        for i, phase_change in enumerate(self.phase_history):
-            phase = phase_change["phase"]
-            start = phase_change["start_turn"]
-            end = self.phase_history[i+1]["start_turn"] if i+1 < len(self.phase_history) else self.current_turn
-            phase_turns[phase] = end - start
+            return {"status": "no_dialogue"}
         
         return {
             "theme": self.theme,
-            "total_turns": self.current_turn,
-            "final_phase": self.current_phase,
-            "phase_turns": phase_turns,
-            "agent1": self.agent1.get_character_info(),
-            "agent2": self.agent2.get_character_info(),
-            "director_statistics": director_stats,
-            "dialogue_length": len(self.dialogue_history)
+            "total_turns": self.turn_count,
+            "participants": [
+                self.agent1.character['name'] if self.agent1 else "Unknown",
+                self.agent2.character['name'] if self.agent2 else "Unknown"
+            ],
+            "director_interventions": len([
+                h for h in self.dialogue_history 
+                if h.get('speaker') == 'Director'
+            ]),
+            "start_time": self.dialogue_history[0].get('timestamp'),
+            "end_time": self.dialogue_history[-1].get('timestamp')
         }
     
-    def reset(self):
-        """セッションをリセット"""
-        self.current_turn = 0
-        self.current_phase = "exploration"
-        self.dialogue_history = []
-        self.phase_history = []
+    def save_dialogue(self, filepath: str):
+        """対話を保存"""
+        save_data = {
+            "summary": self.get_summary(),
+            "dialogue": self.dialogue_history,
+            "director_stats": self.director.get_intervention_stats()
+        }
         
-        self.agent1.reset()
-        self.agent2.reset()
-        self.director.reset()
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(save_data, f, ensure_ascii=False, indent=2)
         
-        self._initialize_session()
+        logger.info(f"Dialogue saved to {filepath}")

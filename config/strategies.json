@@ -1,174 +1,134 @@
 {
-  "discussion_strategies": {
+  "strategies": {
     "deepening": {
       "name": "議論の深化",
-      "description": "表面的な議論を具体的・本質的にする",
-      "interventions": [
-        "もっと具体的な例を挙げて議論してください",
-        "その主張の根拠となる原理は何ですか？",
-        "定義を明確にしてから議論を進めてください",
-        "前提条件を整理してみましょう",
-        "なぜそう考えるのか、理由を3つ挙げてください"
+      "description": "表面的な議論を深く掘り下げる",
+      "triggers": [
+        "表面的な同意の繰り返し",
+        "具体例の不足",
+        "抽象的な話の継続"
       ],
-      "triggers": {
-        "repetition_count": 3,
-        "abstract_level": "high",
-        "evidence_count": 0
-      }
+      "instructions": {
+        "general": "この点についてもう少し深く考えてみましょう。",
+        "agent_specific": "具体的な例や個人的な経験を交えて話してください。"
+      },
+      "questions": [
+        "なぜそう思うのか、もう少し詳しく教えてください。",
+        "具体的にはどういうことでしょうか？",
+        "個人的な経験から何か思い当たることはありますか？"
+      ]
     },
     
     "convergence": {
       "name": "収束誘導",
-      "description": "発散した議論を整理し共通点を見出す",
-      "interventions": [
-        "ここまでの議論で合意できる点を整理してください",
-        "共通の前提は何でしょうか",
-        "違いよりも共通点に注目してみてください",
-        "建設的な妥協点を探してください",
-        "両者の意見の良い点を組み合わせられませんか"
+      "description": "散漫な議論を収束させる",
+      "triggers": [
+        "話題の拡散",
+        "論点の増加",
+        "時間的制約"
       ],
-      "triggers": {
-        "divergence_score": 0.8,
-        "turn_count": 10,
-        "conflict_level": "high"
-      }
+      "instructions": {
+        "general": "これまでの議論をまとめて、焦点を絞りましょう。",
+        "agent_specific": "最も重要だと思う点に絞って話してください。"
+      },
+      "questions": [
+        "これまでの議論で最も重要な点は何でしょうか？",
+        "共通認識として何が得られましたか？",
+        "結論に向けて、どう進めばよいでしょうか？"
+      ]
     },
     
     "perspective_shift": {
       "name": "視点転換",
-      "description": "新しい角度から議論を活性化",
-      "interventions": [
-        "逆の立場から考えてみてください",
-        "第三者の視点ではどう見えるでしょうか",
-        "時間軸を変えて考えてみましょう",
-        "別の分野の知見を応用できませんか",
-        "もし制約がなければどうしますか"
+      "description": "新しい角度から議論を見直す",
+      "triggers": [
+        "議論の停滞",
+        "同じ視点の繰り返し",
+        "創造性の欠如"
       ],
-      "triggers": {
-        "stagnation_count": 5,
-        "same_argument_count": 3
-      }
+      "instructions": {
+        "general": "別の角度から考えてみましょう。",
+        "agent_specific": "今までと違う立場から意見を述べてみてください。"
+      },
+      "questions": [
+        "逆の立場から見るとどうでしょうか？",
+        "10年後の視点から見たらどう思いますか？",
+        "別の文化圏の人ならどう考えるでしょうか？"
+      ]
     },
     
     "constructive_conflict": {
       "name": "建設的対立",
-      "description": "あえて対立を生み出し議論を活性化",
-      "interventions": [
-        "相手の主張の弱点を指摘してください",
-        "批判的に検証してみてください",
-        "反例を挙げてください",
-        "論理的な矛盾を見つけてください",
-        "最も強い反論は何でしょうか"
+      "description": "健全な意見の対立を促進",
+      "triggers": [
+        "過度な同調",
+        "批判的思考の不足",
+        "議論の単調化"
       ],
-      "triggers": {
-        "agreement_level": "too_high",
-        "critical_thinking": "low"
-      }
+      "instructions": {
+        "general": "異なる意見も大切です。率直に話し合いましょう。",
+        "agent_specific": "相手の意見に疑問があれば、建設的に指摘してください。"
+      },
+      "questions": [
+        "この考えの弱点は何でしょうか？",
+        "反対の立場から見た問題点は？",
+        "もっと良い方法はないでしょうか？"
+      ]
     },
     
     "synthesis": {
       "name": "統合と発展",
-      "description": "対立する意見を統合し新しい見解を生む",
-      "interventions": [
-        "両方の意見を統合した新しい視点を提案してください",
-        "対立を超えた第三の道を探してください",
-        "より高次の概念で両者を包含できませんか",
-        "この議論から新しい問いを生み出してください",
-        "創造的な解決策を提案してください"
+      "description": "異なる意見を統合し新しい理解を生む",
+      "triggers": [
+        "十分な意見交換後",
+        "対立点の明確化後",
+        "最終フェーズ"
       ],
-      "triggers": {
-        "maturity_level": "high",
-        "turn_count": 15
-      }
+      "instructions": {
+        "general": "お互いの意見を統合して、新しい理解を作りましょう。",
+        "agent_specific": "両方の意見の良い点を組み合わせて考えてください。"
+      },
+      "questions": [
+        "両方の意見を活かすとどうなるでしょうか？",
+        "この議論から生まれた新しい発見は？",
+        "次のステップは何でしょうか？"
+      ]
     },
     
-    "clarification": {
-      "name": "明確化",
-      "description": "曖昧な点を明確にし、誤解を防ぐ",
-      "interventions": [
-        "その用語の定義を明確にしてください",
-        "具体的にはどういうことですか",
-        "例を挙げて説明してください",
-        "相手の主張を自分の言葉で言い換えてください",
-        "何が論点なのか整理してください"
+    "encouragement": {
+      "name": "激励と促進",
+      "description": "良い流れを強化し議論を活性化",
+      "triggers": [
+        "良い洞察の出現",
+        "建設的な対話",
+        "ブレークスルーの兆し"
       ],
-      "triggers": {
-        "ambiguity_level": "high",
-        "misunderstanding_detected": true
-      }
+      "instructions": {
+        "general": "素晴らしい議論です！この調子で続けましょう。",
+        "agent_specific": "その視点をさらに発展させてください。"
+      },
+      "questions": [
+        "その考えをもっと聞かせてください。",
+        "この発見から何が言えるでしょうか？",
+        "この線でさらに探求してみましょう。"
+      ]
     }
   },
   
-  "discussion_phases": {
-    "exploration": {
-      "name": "探索フェーズ",
-      "goal": "テーマの多面的理解",
-      "duration_turns": 5,
-      "preferred_strategies": ["perspective_shift", "clarification"],
-      "description": "テーマを様々な角度から探索し、議論の土台を作る"
-    },
-    "deepening": {
-      "name": "深化フェーズ",
-      "goal": "本質的な問題の発見",
-      "duration_turns": 5,
-      "preferred_strategies": ["deepening", "constructive_conflict"],
-      "description": "表面的な理解から本質的な理解へ深める"
-    },
-    "convergence": {
-      "name": "収束フェーズ",
-      "goal": "共通理解の構築",
-      "duration_turns": 5,
-      "preferred_strategies": ["convergence", "clarification"],
-      "description": "対立点を整理し、共通の理解を構築する"
-    },
-    "synthesis": {
-      "name": "統合フェーズ",
-      "goal": "新しい知見の創出",
-      "duration_turns": 5,
-      "preferred_strategies": ["synthesis", "perspective_shift"],
-      "description": "議論を統合し、新しい知見や問いを生み出す"
-    }
+  "phase_strategy_mapping": {
+    "exploration": ["perspective_shift", "encouragement"],
+    "deepening": ["deepening", "constructive_conflict"],
+    "convergence": ["convergence", "synthesis"],
+    "synthesis": ["synthesis", "encouragement"]
   },
   
-  "quality_metrics": {
-    "depth_levels": {
-      "1": "表面的な意見交換",
-      "2": "基本的な理由付け",
-      "3": "構造的な議論",
-      "4": "本質的な探求",
-      "5": "創造的な統合"
-    },
-    "productivity_indicators": [
-      "新しいアイデアの生成",
-      "前提の明確化",
-      "矛盾の解決",
-      "共通理解の形成",
-      "建設的な批判"
-    ],
-    "warning_signs": [
-      "同じ主張の繰り返し",
-      "感情的な対立",
-      "論点のすり替え",
-      "具体性の欠如",
-      "建設的でない批判"
-    ]
-  },
-  
-  "intervention_rules": {
-    "frequency": "every_turn",
-    "priority_order": [
-      "clarification",
-      "deepening",
-      "perspective_shift",
-      "convergence",
-      "constructive_conflict",
-      "synthesis"
-    ],
-    "adaptation": {
-      "low_quality": "increase_intervention",
-      "high_quality": "light_touch",
-      "stagnation": "force_perspective_shift",
-      "conflict": "promote_convergence"
+  "intervention_thresholds": {
+    "minimum_turns_between": 2,
+    "confidence_threshold": 0.6,
+    "urgency_levels": {
+      "low": 0.3,
+      "medium": 0.6,
+      "high": 0.8
     }
   }
 }

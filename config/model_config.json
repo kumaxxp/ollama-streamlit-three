@@ -1,0 +1,205 @@
+{
+  "production_models": {
+    "primary": [
+      {
+        "name": "qwen2.5:7b-instruct-q4_K_M",
+        "display_name": "Qwen 2.5 7B (量子化版)",
+        "description": "日本語対話に最適化、4bit量子化で高速・省メモリ",
+        "size": "4.7GB",
+        "vram_required": "6GB",
+        "recommended_for": ["dialogue", "japanese"],
+        "temperature": {
+          "agent": 0.7,
+          "director": 0.3
+        },
+        "priority": 1
+      },
+      {
+        "name": "gemma3:12b",
+        "display_name": "Gemma 3 12B",
+        "description": "Google製最新モデル、バランス型",
+        "size": "8.1GB",
+        "vram_required": "10GB",
+        "recommended_for": ["dialogue", "reasoning"],
+        "temperature": {
+          "agent": 0.7,
+          "director": 0.3
+        },
+        "priority": 2
+      },
+      {
+        "name": "gpt-oss:20b",
+        "display_name": "GPT-OSS 20B",
+        "description": "GPT互換OSS版、高品質な対話生成",
+        "size": "13GB",
+        "vram_required": "16GB",
+        "recommended_for": ["dialogue", "creative"],
+        "temperature": {
+          "agent": 0.8,
+          "director": 0.3
+        },
+        "priority": 3
+      }
+    ],
+    "lightweight": [
+      {
+        "name": "gemma3:4b",
+        "display_name": "Gemma 3 4B",
+        "description": "軽量版、高速レスポンス",
+        "size": "3.3GB",
+        "vram_required": "4GB",
+        "recommended_for": ["fast_response", "director"],
+        "temperature": {
+          "agent": 0.6,
+          "director": 0.2
+        },
+        "priority": 4
+      },
+      {
+        "name": "qwen:7b",
+        "display_name": "Qwen 7B (旧版)",
+        "description": "安定版、フォールバック用",
+        "size": "4.5GB",
+        "vram_required": "6GB",
+        "recommended_for": ["fallback"],
+        "temperature": {
+          "agent": 0.7,
+          "director": 0.3
+        },
+        "priority": 5
+      }
+    ]
+  },
+  
+  "default_models": {
+    "agent": "qwen2.5:7b-instruct-q4_K_M",
+    "director": "gemma3:4b",
+    "fallback": "qwen:7b"
+  },
+  
+  "quantization_levels": {
+    "q4_K_M": {
+      "description": "4bit量子化（K-means）、メモリ効率と品質のバランス",
+      "quality_score": 0.85,
+      "speed_score": 0.9,
+      "memory_efficiency": 0.95
+    },
+    "q5_K_M": {
+      "description": "5bit量子化、より高品質",
+      "quality_score": 0.9,
+      "speed_score": 0.85,
+      "memory_efficiency": 0.85
+    },
+    "q8_0": {
+      "description": "8bit量子化、高品質",
+      "quality_score": 0.95,
+      "speed_score": 0.7,
+      "memory_efficiency": 0.7
+    },
+    "f16": {
+      "description": "16bit浮動小数点、最高品質",
+      "quality_score": 1.0,
+      "speed_score": 0.5,
+      "memory_efficiency": 0.5
+    }
+  },
+  
+  "model_selection_rules": {
+    "dialogue_agent": {
+      "preferred_models": [
+        "qwen2.5:7b-instruct-q4_K_M",
+        "gpt-oss:20b",
+        "gemma3:12b"
+      ],
+      "min_vram": "6GB",
+      "recommended_temperature": 0.7
+    },
+    "director": {
+      "preferred_models": [
+        "gemma3:4b",
+        "qwen2.5:7b-instruct-q4_K_M"
+      ],
+      "min_vram": "4GB",
+      "recommended_temperature": 0.3
+    }
+  },
+  
+  "model_aliases": {
+    "qwen2.5:7b-instruct-q4_K_M": ["qwen2.5-7b-q4", "qwen-instruct"],
+    "gemma3:12b": ["gemma3-12b", "gemma-12b"],
+    "gemma3:4b": ["gemma3-4b", "gemma-small"],
+    "gpt-oss:20b": ["gpt-oss", "gpt-20b"],
+    "qwen:7b": ["qwen-7b", "qwen-old"]
+  },
+  
+  "performance_notes": {
+    "qwen2.5:7b-instruct-q4_K_M": {
+      "pros": [
+        "優れた日本語理解",
+        "指示追従性が高い",
+        "4bit量子化で高速",
+        "メモリ効率が良い"
+      ],
+      "cons": [
+        "複雑な推論はやや苦手",
+        "創造的なタスクは中程度"
+      ],
+      "best_for": "日本語対話、指示ベースのタスク"
+    },
+    "gemma3:12b": {
+      "pros": [
+        "バランスの取れた性能",
+        "推論能力が高い",
+        "多言語対応"
+      ],
+      "cons": [
+        "やや重い",
+        "日本語は中程度"
+      ],
+      "best_for": "汎用対話、論理的思考"
+    },
+    "gpt-oss:20b": {
+      "pros": [
+        "高品質な文章生成",
+        "創造性が高い",
+        "GPT系の挙動"
+      ],
+      "cons": [
+        "メモリ消費大",
+        "処理速度が遅い"
+      ],
+      "best_for": "創造的な対話、長文生成"
+    },
+    "gemma3:4b": {
+      "pros": [
+        "非常に軽量",
+        "高速レスポンス",
+        "Director用に最適"
+      ],
+      "cons": [
+        "複雑なタスクは苦手",
+        "創造性は限定的"
+      ],
+      "best_for": "Director判断、軽量タスク"
+    },
+    "qwen:7b": {
+      "pros": [
+        "安定している",
+        "実績がある"
+      ],
+      "cons": [
+        "旧バージョン",
+        "最新機能なし"
+      ],
+      "best_for": "フォールバック用途"
+    }
+  },
+  
+  "installation_commands": {
+    "qwen2.5:7b-instruct-q4_K_M": "ollama pull qwen2.5:7b-instruct-q4_K_M",
+    "gemma3:12b": "ollama pull gemma3:12b",
+    "gemma3:4b": "ollama pull gemma3:4b",
+    "gpt-oss:20b": "ollama pull gpt-oss:20b",
+    "qwen:7b": "ollama pull qwen:7b"
+  }
+}

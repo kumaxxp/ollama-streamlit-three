@@ -1,336 +1,253 @@
 """
-エージェントクラス
-各対話参加者の基本機能を提供
+Agent - 対話エージェントの実装
+キャラクター設定に基づく自然な対話生成
 """
 
 import json
-import ollama
-from typing import Dict, List, Optional, Any
+import logging
+from typing import Dict, List, Optional
 from datetime import datetime
-import os
+
+logger = logging.getLogger(__name__)
 
 class Agent:
-    """対話エージェントの基底クラス"""
+    """
+    対話エージェント
+    一般的なキャラクター（女子高生、会社員など）として振る舞う
+    """
     
     def __init__(
         self,
         agent_id: str,
         character_type: str,
         model_name: str = "qwen2.5:7b",
-        temperature: float = 0.7
+        temperature: float = 0.7,
+        ollama_client = None
     ):
-        """
-        Args:
-            agent_id: エージェントの識別子
-            character_type: characters.jsonのキー
-            model_name: 使用するOllamaモデル
-            temperature: 生成時の温度パラメータ
-        """
         self.agent_id = agent_id
+        self.character_type = character_type
         self.model_name = model_name
         self.temperature = temperature
+        self.client = ollama_client
         
         # キャラクター設定を読み込み
         self.character = self._load_character(character_type)
-        self.character_type = character_type
         
-        # プロンプトテンプレートを読み込み
-        self.prompt_templates = self._load_prompt_templates()
-        
-        # 動的コンテキスト管理
+        # セッション情報
         self.session_context = {}
         self.turn_directives = []
-        self.memory = []
-        self.response_count = 0
+        self.memory = []  # 発言履歴
         
+        logger.info(f"Agent {agent_id} initialized as {self.character['name']}")
+    
     def _load_character(self, character_type: str) -> Dict:
         """キャラクター設定を読み込み"""
         try:
-            config_path = os.path.join("config", "characters.json")
-            with open(config_path, "r", encoding="utf-8") as f:
+            with open('config/characters.json', 'r', encoding='utf-8') as f:
                 characters = json.load(f)
-                if character_type not in characters:
-                    raise ValueError(f"Character type '{character_type}' not found")
-                return characters[character_type]
+                
+            if character_type in characters['characters']:
+                return characters['characters'][character_type]
+            else:
+                logger.warning(f"Character type {character_type} not found, using default")
+                return self._get_default_character()
+                
         except FileNotFoundError:
-            print(f"Warning: characters.json not found at {config_path}")
+            logger.error("characters.json not found, using default character")
             return self._get_default_character()
         except Exception as e:
-            print(f"Error loading character: {e}")
+            logger.error(f"Error loading character: {e}")
             return self._get_default_character()
     
     def _get_default_character(self) -> Dict:
-        """デフォルトキャラクター設定"""
+        """デフォルトキャラクター（フォールバック用）"""
         return {
-            "name": "汎用エージェント",
-            "personality": {
-                "base": "中立的で建設的な議論参加者",
-                "traits": ["論理的", "客観的", "協力的"],
-                "communication_style": "明確で簡潔な説明"
-            },
-            "expertise": ["一般知識", "論理的思考"],
-            "behavioral_rules": [
-                "論理的に議論する",
-                "相手の意見を尊重する",
-                "建設的な提案を心がける"
-            ],
-            "speaking_patterns": {
-                "opening": ["私の見解では〜", "〜と考えます"],
-                "challenging": ["しかし〜はどうでしょうか", "別の観点から〜"],
-                "agreeing": ["その通りです", "同意見です"]
+            "name": "対話参加者",
+            "personality": "中立的で建設的な議論を心がける",
+            "speaking_style": "丁寧で分かりやすい",
+            "background": "一般的な知識を持つ対話者",
+            "values": "相互理解と建設的な議論",
+            "behavioral_patterns": {
+                "greeting": ["こんにちは", "よろしくお願いします"],
+                "agreement": ["なるほど", "その通りですね"],
+                "disagreement": ["別の見方もあるかもしれません", "私はこう思います"]
             }
         }
     
-    def _load_prompt_templates(self) -> Dict:
-        """プロンプトテンプレートを読み込み"""
-        try:
-            config_path = os.path.join("config", "prompt_templates.json")
-            with open(config_path, "r", encoding="utf-8") as f:
-                templates = json.load(f)
-                return templates["agent_prompt_template"]
-        except FileNotFoundError:
-            print(f"Warning: prompt_templates.json not found at {config_path}")
-            return self._get_default_templates()
-        except Exception as e:
-            print(f"Error loading templates: {e}")
-            return self._get_default_templates()
-    
-    def _get_default_templates(self) -> Dict:
-        """デフォルトテンプレート"""
-        return {
-            "base": "あなたは{character_base}です。",
-            "session": "テーマ: {theme}",
-            "turn": "指示: {director_instruction}",
-            "response": "相手の発言: {opponent_message}\n\n応答してください。"
-        }
-    
-    def set_session_context(self, theme: str, goal: str = "建設的な議論", phase: str = "探索"):
+    def set_session_context(self, theme: str, goal: str, phase: str):
         """セッションコンテキストを設定"""
         self.session_context = {
             "theme": theme,
-            "discussion_goal": goal,
-            "current_phase": phase
+            "goal": goal,
+            "phase": phase,
+            "start_time": datetime.now().isoformat()
         }
     
-    def add_directive(self, instruction: str, attention_points: List[str] = None):
+    def add_directive(self, instruction: str, attention_points: List[str]):
         """Directorからの指示を追加"""
-        directive = {
+        self.turn_directives.append({
             "instruction": instruction,
-            "attention_points": attention_points or [],
+            "attention_points": attention_points,
             "timestamp": datetime.now().isoformat()
-        }
-        self.turn_directives.append(directive)
-        
-        # 古い指示を削除（最新5つまで保持）
-        if len(self.turn_directives) > 5:
-            self.turn_directives = self.turn_directives[-5:]
-    
-    def add_to_memory(self, role: str, content: str):
-        """メモリに発言を追加"""
-        self.memory.append({
-            "role": role,
-            "content": content,
-            "turn": len(self.memory)
         })
-        
-        # メモリサイズ制限（最新20発言まで）
-        if len(self.memory) > 20:
-            self.memory = self.memory[-20:]
     
-    def build_prompt(self, opponent_message: str) -> str:
-        """完全なプロンプトを構築"""
-        # Base prompt (キャラクター設定)
-        character_traits = ", ".join(self.character["personality"]["traits"])
-        character_expertise = ", ".join(self.character["expertise"])
-        behavioral_rules = "\n".join(f"- {rule}" for rule in self.character["behavioral_rules"])
+    def _build_system_prompt(self) -> str:
+        """システムプロンプトを構築"""
+        # キャラクターのプロンプトテンプレートを使用
+        if 'prompt_template' in self.character:
+            # テンプレートに値を埋め込み
+            template = self.character['prompt_template']
+            return template.format(
+                name=self.character['name'],
+                personality=self.character.get('personality', ''),
+                speaking_style=self.character.get('speaking_style', ''),
+                background=self.character.get('background', ''),
+                values=self.character.get('values', '')
+            )
         
-        base_prompt = self.prompt_templates["base"].format(
-            character_base=self.character["personality"]["base"],
-            character_traits=character_traits,
-            character_expertise=character_expertise,
-            behavioral_rules=behavioral_rules
-        )
-        
-        # Session prompt (セッション設定)
-        session_prompt = self.prompt_templates["session"].format(
-            theme=self.session_context.get("theme", "未設定"),
-            discussion_goal=self.session_context.get("discussion_goal", "建設的な議論"),
-            current_phase=self.session_context.get("current_phase", "探索")
-        )
-        
-        # Turn prompt (ターン毎の指示)
-        recent_directive = self.turn_directives[-1] if self.turn_directives else {
-            "instruction": "自由に議論してください",
-            "attention_points": []
-        }
-        recent_context = self._get_recent_context()
-        attention_points = "\n".join(f"- {point}" for point in recent_directive["attention_points"])
-        
-        turn_prompt = self.prompt_templates["turn"].format(
-            recent_context=recent_context,
-            director_instruction=recent_directive["instruction"],
-            attention_points=attention_points
-        )
-        
-        # Response prompt (応答生成指示)
-        response_prompt = self.prompt_templates["response"].format(
-            opponent_message=opponent_message
-        )
-        
-        return base_prompt + session_prompt + turn_prompt + response_prompt
+        # テンプレートがない場合は標準形式
+        return f"""
+あなたは{self.character['name']}です。
+
+【基本設定】
+性格: {self.character.get('personality', '未設定')}
+話し方: {self.character.get('speaking_style', '自然な日本語')}
+背景: {self.character.get('background', '一般的な背景')}
+価値観: {self.character.get('values', '建設的な対話')}
+
+【重要な指示】
+- あなたのキャラクターを一貫して保ってください
+- 相手の発言をよく聞き、それに応答してください
+- 自然な対話を心がけてください
+- 議論を建設的に進めてください
+"""
     
-    def _get_recent_context(self, max_turns: int = 3) -> str:
-        """直近の文脈を取得"""
-        if not self.memory:
-            return "（議論開始）"
+    def build_prompt(self, context: Dict) -> str:
+        """
+        対話用プロンプトを構築
         
-        recent = self.memory[-max_turns:]
-        context_lines = []
-        for item in recent:
-            role = "自分" if item["role"] == self.agent_id else item["role"]
-            # 長い文は省略
-            content = item['content']
-            if len(content) > 100:
-                content = content[:100] + "..."
-            context_lines.append(f"{role}: {content}")
-            
-        return "\n".join(context_lines)
+        Args:
+            context: {
+                "opponent_name": str,
+                "opponent_message": str,
+                "recent_history": List[Dict],
+                "director_instruction": Optional[str]
+            }
+        """
+        opponent_name = context.get('opponent_name', '相手')
+        opponent_message = context.get('opponent_message', '')
+        recent_history = context.get('recent_history', [])
+        director_instruction = context.get('director_instruction', '')
+        
+        # 基本プロンプト
+        prompt_parts = [
+            f"あなたは{self.character['name']}として、{opponent_name}と対話しています。",
+            f"\nテーマ: {self.session_context.get('theme', '自由討論')}",
+            f"現在のフェーズ: {self.session_context.get('phase', 'exploration')}\n"
+        ]
+        
+        # 最近の履歴があれば追加
+        if recent_history:
+            prompt_parts.append("\n【これまでの対話】")
+            for entry in recent_history[-3:]:  # 最新3つ
+                speaker = entry.get('speaker', '不明')
+                message = entry.get('message', '')
+                prompt_parts.append(f"{speaker}: 「{message}」")
+        
+        # 相手の最新メッセージ
+        if opponent_message:
+            prompt_parts.append(f"\n【{opponent_name}の発言】")
+            prompt_parts.append(f"「{opponent_message}」")
+        
+        # Director指示があれば追加
+        if director_instruction:
+            prompt_parts.append(f"\n【アドバイス】")
+            prompt_parts.append(director_instruction)
+        
+        # 最新のDirective
+        if self.turn_directives:
+            latest_directive = self.turn_directives[-1]
+            prompt_parts.append(f"\n【今回の注意点】")
+            prompt_parts.append(latest_directive['instruction'])
+            if latest_directive['attention_points']:
+                prompt_parts.append("- " + "\n- ".join(latest_directive['attention_points']))
+        
+        # 応答指示
+        prompt_parts.append(f"\n上記を踏まえて、{opponent_name}に対して{self.character['name']}として応答してください。")
+        prompt_parts.append("自然で、あなたらしい発言を心がけてください。")
+        
+        return "\n".join(prompt_parts)
     
-    def generate_response(self, opponent_message: str, stream: bool = False) -> str:
-        """応答を生成"""
-        prompt = self.build_prompt(opponent_message)
+    async def generate_response(self, context: Dict) -> str:
+        """
+        応答を生成
+        
+        Args:
+            context: 対話コンテキスト
+        
+        Returns:
+            生成された応答
+        """
+        prompt = self.build_prompt(context)
+        system_prompt = self._build_system_prompt()
         
         try:
-            if stream:
-                # ストリーミング対応（UIで使用）
-                response_stream = ollama.chat(
-                    model=self.model_name,
-                    messages=[
-                        {"role": "system", "content": prompt},
-                        {"role": "user", "content": opponent_message}
-                    ],
-                    stream=True,  # streamはoptionsの外
-                    options={
-                        "temperature": self.temperature,
-                        "num_predict": 200
-                    }
-                )
-                
-                full_response = ""
-                for chunk in response_stream:
-                    if isinstance(chunk, dict):
-                        # messageキーとcontentキーの両方をチェック
-                        if 'message' in chunk:
-                            if isinstance(chunk['message'], dict) and 'content' in chunk['message']:
-                                content = chunk['message']['content']
-                            elif isinstance(chunk['message'], str):
-                                content = chunk['message']
-                            else:
-                                continue
-                        elif 'content' in chunk:
-                            content = chunk['content']
-                        else:
-                            continue
-                        
-                        full_response += content
-                        yield content
-                
-                # メモリに追加
-                if full_response:
-                    self.add_to_memory(self.agent_id, full_response)
-                    self.response_count += 1
-                
-            else:
-                # 通常の応答
-                response = ollama.chat(
-                    model=self.model_name,
-                    messages=[
-                        {"role": "system", "content": prompt},
-                        {"role": "user", "content": opponent_message}
-                    ],
-                    options={
-                        "temperature": self.temperature,
-                        "num_predict": 200
-                    }
-                )
-                
-                # レスポンス形式のチェック
-                generated_text = ""
-                if isinstance(response, dict):
-                    if 'message' in response:
-                        if isinstance(response['message'], dict) and 'content' in response['message']:
-                            generated_text = response['message']['content']
-                        elif isinstance(response['message'], str):
-                            generated_text = response['message']
-                    elif 'content' in response:
-                        generated_text = response['content']
-                    elif 'response' in response:
-                        generated_text = response['response']
-                elif isinstance(response, str):
-                    generated_text = response
-                
-                if not generated_text:
-                    print(f"Unexpected response format: {response}")
-                    generated_text = "申し訳ありません、応答の生成に失敗しました。"
-                
-                # メモリに追加
-                self.add_to_memory(self.agent_id, generated_text)
-                self.response_count += 1
-                
-                return generated_text
-                
+            response = self.client.chat(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                options={
+                    "temperature": self.temperature,
+                    "top_p": 0.95,
+                    "seed": None
+                },
+                stream=False
+            )
+            
+            generated_text = response['message']['content']
+            
+            # メモリに追加
+            self.memory.append({
+                "role": "assistant",
+                "content": generated_text,
+                "timestamp": datetime.now().isoformat()
+            })
+            
+            return generated_text
+            
         except Exception as e:
-            error_msg = f"[応答生成エラー: {e}]"
-            print(f"Error details: {error_msg}")
-            print(f"Model: {self.model_name}")
-            print(f"Prompt length: {len(prompt)}")
-            
-            # フォールバック応答
-            fallback_response = "申し訳ありません、応答の生成中にエラーが発生しました。議論を続けましょう。"
-            self.add_to_memory(self.agent_id, fallback_response)
-            self.response_count += 1
-            
-            if stream:
-                yield fallback_response
-            else:
-                return fallback_response
+            logger.error(f"Response generation error for {self.agent_id}: {e}")
+            return self._get_fallback_response(context)
+    
+    def _get_fallback_response(self, context: Dict) -> str:
+        """エラー時のフォールバック応答"""
+        opponent_name = context.get('opponent_name', '相手')
+        
+        # キャラクターに応じた基本応答
+        if 'high_school' in self.character_type:
+            return f"{opponent_name}さん、それってすごく難しいですね...でも面白い！"
+        elif 'office_worker' in self.character_type:
+            return f"{opponent_name}さんの意見、実務的な観点から興味深いですね。"
+        elif 'college_student' in self.character_type:
+            return f"{opponent_name}さん、その視点は新鮮ですね。もう少し考えてみます。"
+        else:
+            return f"{opponent_name}さん、なるほど、そういう見方もありますね。"
     
     def get_character_info(self) -> Dict:
         """キャラクター情報を取得"""
         return {
             "id": self.agent_id,
-            "name": self.character["name"],
+            "name": self.character['name'],
             "type": self.character_type,
-            "personality": self.character["personality"]["base"],
-            "expertise": self.character["expertise"],
-            "response_count": self.response_count
+            "personality": self.character.get('personality', ''),
+            "background": self.character.get('background', '')
         }
-    
-    def get_speaking_pattern(self, pattern_type: str = "opening") -> str:
-        """話し方パターンを取得"""
-        patterns = self.character.get("speaking_patterns", {})
-        pattern_list = patterns.get(pattern_type, [""])
-        if pattern_list:
-            import random
-            return random.choice(pattern_list)
-        return ""
     
     def reset(self):
         """エージェントをリセット"""
         self.session_context = {}
         self.turn_directives = []
         self.memory = []
-        self.response_count = 0
-        
-    def get_state(self) -> Dict:
-        """現在の状態を取得（デバッグ用）"""
-        return {
-            "agent_id": self.agent_id,
-            "character_type": self.character_type,
-            "model_name": self.model_name,
-            "temperature": self.temperature,
-            "session_context": self.session_context,
-            "directive_count": len(self.turn_directives),
-            "memory_size": len(self.memory),
-            "response_count": self.response_count
-        }
+        logger.info(f"Agent {self.agent_id} reset")
