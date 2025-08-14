@@ -77,6 +77,8 @@ with st.sidebar:
     
     # キャラクターオプション
     character_options = {
+        "AI-tuber-college_student_girl": "やな（女子大生っぽいAI・明るい・うかつ）",
+        "AI-tuber-high_school_girl": "あゆ（女子高生っぽいAI・冷静沈着）",
         "high_school_girl_optimistic": "さくら（高校2年生・明るい）",
         "office_worker_tired": "田中（32歳・営業職）",
         "college_student_curious": "ユウキ（大学3年生・哲学科）",

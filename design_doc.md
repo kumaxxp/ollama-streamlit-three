@@ -107,6 +107,8 @@ ollama-streamlit-three/
 **責務**: 一般人キャラクターとしての自然な応答生成
 
 **キャラクタータイプ**:
+- `AI-tuber-college_student_girl` : 女子大生っぽいAI
+- `AI-tuber-high_school_girl` : 女子高生っぽいAI
 - `high_school_girl_optimistic`: 明るい高校生
 - `office_worker_tired`: 疲れ気味の会社員
 - `college_student_curious`: 好奇心旺盛な大学生
