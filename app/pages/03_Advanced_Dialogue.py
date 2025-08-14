@@ -76,10 +76,10 @@ with st.sidebar:
     # キャラクター選択
     st.subheader("👥 キャラクター選択")
     
-    # キャラクターオプション
+    # キャラクターオプション（キーが正確にcharacters.jsonと一致）
     character_options = {
-        "AI-tuber-college_student_girl": "やな（女子大生っぽいAI・明るい・うかつ）",
-        "AI-tuber-high_school_girl": "あゆ（女子高生っぽいAI・冷静沈着）",
+        "AI-tuber-college_student_girl": "やな（AI姉・明るいお姉ちゃんAI）",
+        "AI-tuber-high_school_girl": "あゆ（AI妹・冷静なツッコミAI）",
         "high_school_girl_optimistic": "さくら（高校2年生・明るい）",
         "office_worker_tired": "田中（32歳・営業職）",
         "college_student_curious": "ユウキ（大学3年生・哲学科）",
@@ -95,22 +95,29 @@ with st.sidebar:
             "選択",
             list(character_options.keys()),
             format_func=lambda x: character_options[x],
-            key="char1_select"
+            key="char1_select",
+            index=0  # デフォルトでやなを選択
         )
     
     with col2:
         st.markdown("**キャラクター2**")
         # char1と異なるデフォルトを設定
-        char2_options = [k for k in character_options.keys() if k != char1_key]
-        if not char2_options:
-            char2_options = list(character_options.keys())
+        char2_options = list(character_options.keys())
+        # デフォルトであゆを選択するため、インデックスを設定
+        default_index = 1 if len(char2_options) > 1 else 0
         
         char2_key = st.selectbox(
             "選択",
             char2_options,
             format_func=lambda x: character_options[x],
-            key="char2_select"
+            key="char2_select",
+            index=default_index  # デフォルトであゆを選択
         )
+    
+    # デバッグ情報表示
+    if st.checkbox("デバッグ情報を表示"):
+        st.info(f"選択されたキャラクター1: {char1_key}")
+        st.info(f"選択されたキャラクター2: {char2_key}")
     
     # キャラクター詳細表示
     if st.checkbox("キャラクター詳細を表示"):
@@ -371,17 +378,21 @@ with col_main:
             client = ollama.Client()
             st.session_state.dialogue_manager = DialogueManager(client, director_model)
             
-            # エージェント設定
+            # エージェント設定（character_typeが正確に一致することを確認）
             agent1_config = {
-                'character_type': char1_key,
+                'character_type': char1_key,  # ここが重要：正確なキー名
                 'model': agent_model,
                 'temperature': agent_temp
             }
             agent2_config = {
-                'character_type': char2_key,
+                'character_type': char2_key,  # ここが重要：正確なキー名
                 'model': agent_model,
                 'temperature': agent_temp
             }
+            
+            # デバッグ出力
+            st.info(f"Agent1: {char1_key} → {character_options.get(char1_key, '不明')}")
+            st.info(f"Agent2: {char2_key} → {character_options.get(char2_key, '不明')}")
             
             # 初期化
             st.session_state.dialogue_manager.initialize(
@@ -393,9 +404,10 @@ with col_main:
             st.session_state.dialogue_manager.max_turns = max_turns
             st.session_state.max_turns = max_turns  # セッション状態に保存
             
-            # 長さ制御設定をDirectorに反映
-            if auto_length_balance:
-                st.session_state.dialogue_manager.director.target_length = response_length_mode
+            # 長さ制御設定をDirectorに反映（変数が存在する場合のみ）
+            if 'auto_length_balance' in locals() and auto_length_balance:
+                if 'response_length_mode' in locals():
+                    st.session_state.dialogue_manager.director.target_length = response_length_mode
             
             st.session_state.dialogue_history = []
             st.session_state.is_running = True

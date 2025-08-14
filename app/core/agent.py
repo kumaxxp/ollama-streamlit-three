@@ -42,21 +42,48 @@ class Agent:
     
     def _load_character(self, character_type: str) -> Dict:
         """キャラクター設定を読み込み"""
-        try:
-            with open('config/characters.json', 'r', encoding='utf-8') as f:
-                characters = json.load(f)
-                
-            if character_type in characters['characters']:
-                return characters['characters'][character_type]
-            else:
-                logger.warning(f"Character type {character_type} not found, using default")
-                return self._get_default_character()
-                
-        except FileNotFoundError:
-            logger.error("characters.json not found, using default character")
+        import os
+        
+        # 複数のパスを試す
+        possible_paths = [
+            'config/characters.json',
+            './config/characters.json',
+            '../config/characters.json',
+            '../../config/characters.json',
+            os.path.join(os.path.dirname(__file__), '../../config/characters.json')
+        ]
+        
+        characters_data = None
+        used_path = None
+        
+        for path in possible_paths:
+            if os.path.exists(path):
+                try:
+                    with open(path, 'r', encoding='utf-8') as f:
+                        characters_data = json.load(f)
+                        used_path = path
+                        logger.info(f"Characters loaded from: {path}")
+                        break
+                except Exception as e:
+                    logger.error(f"Error loading from {path}: {e}")
+                    continue
+        
+        if not characters_data:
+            logger.error(f"characters.json not found in any of these paths: {possible_paths}")
+            logger.error(f"Current working directory: {os.getcwd()}")
             return self._get_default_character()
-        except Exception as e:
-            logger.error(f"Error loading character: {e}")
+        
+        # キャラクターを取得
+        if 'characters' in characters_data:
+            if character_type in characters_data['characters']:
+                logger.info(f"Character '{character_type}' loaded successfully")
+                return characters_data['characters'][character_type]
+            else:
+                logger.warning(f"Character type '{character_type}' not found in characters.json")
+                logger.warning(f"Available characters: {list(characters_data['characters'].keys())}")
+                return self._get_default_character()
+        else:
+            logger.error("'characters' key not found in JSON")
             return self._get_default_character()
     
     def _get_default_character(self) -> Dict:
