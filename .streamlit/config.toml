@@ -1,0 +1,29 @@
+[server]
+# ポート設定
+port = 8501
+
+# 警告レベル設定
+# headless = true
+runOnSave = true
+
+# メモリ管理
+maxCachedMessageSize = 200
+
+[runner]
+# マジックコマンドを無効化（警告削減）
+magicEnabled = false
+
+# Fast reruns
+fastReruns = true
+
+[client]
+# キャッシュをクリアするタイミング
+caching = true
+
+[theme]
+# ダークテーマ設定（お好みで）
+base = "dark"
+
+[deprecation]
+# 非推奨警告を非表示
+showfileUploaderEncoding = false

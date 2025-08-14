@@ -420,3 +420,46 @@ class DialogueManager:
             json.dump(save_data, f, ensure_ascii=False, indent=2)
         
         logger.info(f"Dialogue saved to {filepath}")
+
+
+    def run_turn_sync(self) -> Dict:
+        """
+        run_turnの同期版（Streamlit用）
+        非同期関数を同期的に実行する
+        """
+        import asyncio
+        import sys
+        
+        # 既存のイベントループがある場合の処理
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        
+        if loop and loop.is_running():
+            # Streamlit環境など、既にループが動いている場合
+            import concurrent.futures
+            import threading
+            
+            # 別スレッドで実行
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(asyncio.run, self.run_turn())
+                return future.result()
+        else:
+            # 通常の同期実行
+            return asyncio.run(self.run_turn())
+
+    def run_dialogue_sync(self, max_turns: Optional[int] = None) -> List[Dict]:
+        """
+        run_dialogueの同期版（Streamlit用）
+        """
+        import asyncio
+        
+        try:
+            # 新しいイベントループで実行
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(self.run_dialogue(max_turns))
+            return result
+        finally:
+            loop.close()        

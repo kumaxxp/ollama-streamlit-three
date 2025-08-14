@@ -7,6 +7,7 @@ Advanced Dialogue System - Streamlit UI
 import streamlit as st
 import json
 import asyncio
+import time
 from datetime import datetime
 import sys
 import os
@@ -146,6 +147,7 @@ with st.sidebar:
         def get_available_models():
             """Ollamaで利用可能なモデル一覧を取得"""
             try:
+                import ollama
                 client = ollama.Client()
                 models_list = client.list()
                 
@@ -389,6 +391,7 @@ with col_main:
             )
             st.session_state.dialogue_manager.enable_director = enable_director
             st.session_state.dialogue_manager.max_turns = max_turns
+            st.session_state.max_turns = max_turns  # セッション状態に保存
             
             # 長さ制御設定をDirectorに反映
             if auto_length_balance:
@@ -418,14 +421,24 @@ with col_main:
             st.rerun()
 
 # 対話実行
-async def run_dialogue_async():
-    """非同期で対話を実行"""
+def run_dialogue_sync():
+    """同期的に対話を実行（Streamlit用）"""
     manager = st.session_state.dialogue_manager
+    max_turns = st.session_state.get('max_turns', 20)
     
     while st.session_state.is_running and st.session_state.current_turn < max_turns:
         try:
-            # 1ターン実行
-            turn_result = await manager.run_turn()
+            # 非同期関数を同期的に実行
+            import asyncio
+            
+            # 新しいイベントループを作成して実行
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                turn_result = loop.run_until_complete(manager.run_turn())
+            finally:
+                loop.close()
+            
             st.session_state.current_turn += 1
             st.session_state.dialogue_history.append(turn_result)
             
@@ -438,8 +451,9 @@ async def run_dialogue_async():
                 st.info(f"🎬 **Director介入**: {intervention['reason']}")
                 st.write(f"_{intervention['message']}_")
             
-            # 少し待機
-            await asyncio.sleep(1)
+            # UIを更新
+            time.sleep(0.5)  # 少し待機
+            st.rerun()
             
         except Exception as e:
             st.error(f"エラーが発生しました: {e}")
@@ -484,8 +498,8 @@ def display_dialogue_turn(turn_data):
 
 # 実行処理
 if st.session_state.is_running and st.session_state.dialogue_manager:
-    # 非同期実行
-    asyncio.run(run_dialogue_async())
+    # 同期的に実行
+    run_dialogue_sync()
 
 # 対話履歴の表示
 with col_stats:
