@@ -209,22 +209,36 @@ class Agent:
                         {"role": "system", "content": prompt},
                         {"role": "user", "content": opponent_message}
                     ],
+                    stream=True,  # streamはoptionsの外
                     options={
                         "temperature": self.temperature,
-                        "num_predict": 200,
-                        "stream": True
+                        "num_predict": 200
                     }
                 )
                 
                 full_response = ""
                 for chunk in response_stream:
-                    if 'message' in chunk and 'content' in chunk['message']:
-                        full_response += chunk['message']['content']
-                        yield chunk['message']['content']
+                    if isinstance(chunk, dict):
+                        # messageキーとcontentキーの両方をチェック
+                        if 'message' in chunk:
+                            if isinstance(chunk['message'], dict) and 'content' in chunk['message']:
+                                content = chunk['message']['content']
+                            elif isinstance(chunk['message'], str):
+                                content = chunk['message']
+                            else:
+                                continue
+                        elif 'content' in chunk:
+                            content = chunk['content']
+                        else:
+                            continue
+                        
+                        full_response += content
+                        yield content
                 
                 # メモリに追加
-                self.add_to_memory(self.agent_id, full_response)
-                self.response_count += 1
+                if full_response:
+                    self.add_to_memory(self.agent_id, full_response)
+                    self.response_count += 1
                 
             else:
                 # 通常の応答
@@ -240,7 +254,24 @@ class Agent:
                     }
                 )
                 
-                generated_text = response['message']['content']
+                # レスポンス形式のチェック
+                generated_text = ""
+                if isinstance(response, dict):
+                    if 'message' in response:
+                        if isinstance(response['message'], dict) and 'content' in response['message']:
+                            generated_text = response['message']['content']
+                        elif isinstance(response['message'], str):
+                            generated_text = response['message']
+                    elif 'content' in response:
+                        generated_text = response['content']
+                    elif 'response' in response:
+                        generated_text = response['response']
+                elif isinstance(response, str):
+                    generated_text = response
+                
+                if not generated_text:
+                    print(f"Unexpected response format: {response}")
+                    generated_text = "申し訳ありません、応答の生成に失敗しました。"
                 
                 # メモリに追加
                 self.add_to_memory(self.agent_id, generated_text)
@@ -250,8 +281,19 @@ class Agent:
                 
         except Exception as e:
             error_msg = f"[応答生成エラー: {e}]"
-            print(error_msg)
-            return error_msg
+            print(f"Error details: {error_msg}")
+            print(f"Model: {self.model_name}")
+            print(f"Prompt length: {len(prompt)}")
+            
+            # フォールバック応答
+            fallback_response = "申し訳ありません、応答の生成中にエラーが発生しました。議論を続けましょう。"
+            self.add_to_memory(self.agent_id, fallback_response)
+            self.response_count += 1
+            
+            if stream:
+                yield fallback_response
+            else:
+                return fallback_response
     
     def get_character_info(self) -> Dict:
         """キャラクター情報を取得"""
