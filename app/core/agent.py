@@ -164,17 +164,37 @@ class Agent:
             prompt_parts.append(f"\n【アドバイス】")
             prompt_parts.append(director_instruction)
         
-        # 最新のDirective
+        # 最新のDirective（長さ指示を含む）
         if self.turn_directives:
             latest_directive = self.turn_directives[-1]
             prompt_parts.append(f"\n【今回の注意点】")
             prompt_parts.append(latest_directive['instruction'])
             if latest_directive['attention_points']:
                 prompt_parts.append("- " + "\n- ".join(latest_directive['attention_points']))
+            
+            # 長さ指示が含まれているかチェック
+            length_guidance = None
+            for point in latest_directive['attention_points']:
+                if "簡潔" in point:
+                    length_guidance = "50-100文字程度で簡潔に"
+                elif "詳細" in point:
+                    length_guidance = "200-300文字程度で詳しく"
+                elif "標準" in point:
+                    length_guidance = "100-200文字程度で"
+            
+            if length_guidance:
+                prompt_parts.append(f"\n【応答の長さ】{length_guidance}")
         
         # 応答指示
         prompt_parts.append(f"\n上記を踏まえて、{opponent_name}に対して{self.character['name']}として応答してください。")
         prompt_parts.append("自然で、あなたらしい発言を心がけてください。")
+        
+        # フォーマット指示を追加
+        prompt_parts.append("\n【応答形式の注意】")
+        prompt_parts.append("- 挨拶（こんにちは等）は不要です。すぐに本題に入ってください")
+        prompt_parts.append("- 箇条書きや見出しは使わず、自然な会話文で応答してください")
+        prompt_parts.append("- マークダウン記号（##、**、-、・など）は使わないでください")
+        prompt_parts.append("- 普通に会話するような、流れるような文章で話してください")
         
         return "\n".join(prompt_parts)
     

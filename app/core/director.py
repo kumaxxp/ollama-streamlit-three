@@ -28,6 +28,10 @@ class AutonomousDirector:
         self.intervention_history = []
         self.current_phase = "exploration"
         
+        # 長さ分析用の履歴
+        self.length_history = []
+        self.target_length = "標準"  # デフォルトは標準
+        
     def load_prompts(self):
         """Director用プロンプトをJSONから読み込み"""
         try:
@@ -44,9 +48,104 @@ class AutonomousDirector:
             "evaluation_prompt": "対話を評価し、介入の必要性を判断してください。"
         }
     
+    def analyze_response_lengths(self, dialogue_context: List[Dict]) -> Dict:
+        """
+        対話の長さを分析
+        
+        Returns:
+            {
+                "average_length": float,
+                "recent_trend": str,  # "increasing", "decreasing", "stable"
+                "balance": str,  # "balanced", "imbalanced"
+                "recommendation": str  # "簡潔", "標準", "詳細"
+            }
+        """
+        if not dialogue_context:
+            return {
+                "average_length": 0,
+                "recent_trend": "stable",
+                "balance": "balanced",
+                "recommendation": "標準"
+            }
+        
+        # 最近5ターンの長さを分析
+        recent_messages = dialogue_context[-5:] if len(dialogue_context) >= 5 else dialogue_context
+        
+        lengths = []
+        agent_lengths = {"agent1": [], "agent2": []}
+        
+        for entry in recent_messages:
+            if entry.get('speaker') != 'Director':
+                message = entry.get('message', '')
+                length = len(message)
+                lengths.append(length)
+                
+                # エージェント別に記録
+                speaker = entry.get('speaker', '')
+                if 'やな' in speaker or 'さくら' in speaker or '田中' in speaker:
+                    agent_lengths["agent1"].append(length)
+                else:
+                    agent_lengths["agent2"].append(length)
+        
+        if not lengths:
+            return {
+                "average_length": 0,
+                "recent_trend": "stable",
+                "balance": "balanced",
+                "recommendation": "標準"
+            }
+        
+        # 平均長さ
+        avg_length = sum(lengths) / len(lengths)
+        
+        # トレンド分析
+        if len(lengths) >= 3:
+            recent_avg = sum(lengths[-2:]) / 2
+            older_avg = sum(lengths[:-2]) / (len(lengths) - 2)
+            if recent_avg > older_avg * 1.3:
+                trend = "increasing"
+            elif recent_avg < older_avg * 0.7:
+                trend = "decreasing"
+            else:
+                trend = "stable"
+        else:
+            trend = "stable"
+        
+        # バランス分析
+        if agent_lengths["agent1"] and agent_lengths["agent2"]:
+            avg1 = sum(agent_lengths["agent1"]) / len(agent_lengths["agent1"])
+            avg2 = sum(agent_lengths["agent2"]) / len(agent_lengths["agent2"])
+            ratio = max(avg1, avg2) / min(avg1, avg2) if min(avg1, avg2) > 0 else 1
+            balance = "imbalanced" if ratio > 2 else "balanced"
+        else:
+            balance = "balanced"
+        
+        # 推奨を決定
+        if avg_length > 250:
+            recommendation = "簡潔"
+        elif avg_length < 80:
+            recommendation = "詳細"
+        else:
+            recommendation = "標準"
+        
+        # 履歴に追加
+        self.length_history.append({
+            "turn": len(dialogue_context),
+            "average": avg_length,
+            "trend": trend,
+            "balance": balance
+        })
+        
+        return {
+            "average_length": avg_length,
+            "recent_trend": trend,
+            "balance": balance,
+            "recommendation": recommendation
+        }
+    
     async def evaluate_dialogue(self, dialogue_context: List[Dict]) -> Dict:
         """
-        対話を評価し、自発的に介入を判断
+        対話を評価し、自発的に介入を判断（長さ制御を含む）
         
         Returns:
             {
@@ -54,14 +153,21 @@ class AutonomousDirector:
                 "reason": str,
                 "intervention_type": str,
                 "message": str,
+                "response_length_guide": str,
                 "confidence": float
             }
         """
+        # 長さ分析を実行
+        length_analysis = self.analyze_response_lengths(dialogue_context)
+        
         # 最近の対話を文脈として整形
         context_str = self._format_dialogue_context(dialogue_context)
         
-        # 評価プロンプト構築
-        evaluation_prompt = self._build_evaluation_prompt(context_str)
+        # 評価プロンプト構築（長さ情報を含む）
+        evaluation_prompt = self._build_evaluation_prompt_with_length(
+            context_str, 
+            length_analysis
+        )
         
         try:
             # LLMによる自発的判断
@@ -82,13 +188,21 @@ class AutonomousDirector:
             # レスポンスをパース
             result = json.loads(response['message']['content'])
             
+            # 長さガイドが含まれていない場合はデフォルト値を設定
+            if "response_length_guide" not in result:
+                result["response_length_guide"] = length_analysis["recommendation"]
+            
+            # 現在の目標長さを更新
+            self.target_length = result.get("response_length_guide", "標準")
+            
             # 介入履歴に記録（学習用）
             if result.get("intervention_needed", False):
                 self.intervention_history.append({
                     "timestamp": datetime.now().isoformat(),
                     "type": result.get("intervention_type"),
                     "reason": result.get("reason"),
-                    "phase": self.current_phase
+                    "phase": self.current_phase,
+                    "length_guide": result.get("response_length_guide")
                 })
             
             return result
@@ -100,8 +214,37 @@ class AutonomousDirector:
                 "reason": "評価エラー",
                 "intervention_type": "none",
                 "message": "",
+                "response_length_guide": "標準",
                 "confidence": 0.0
             }
+    
+    def _build_evaluation_prompt_with_length(self, context: str, length_analysis: Dict) -> str:
+        """長さ情報を含む評価プロンプトの構築"""
+        return f"""
+現在の対話フェーズ: {self.current_phase}
+
+最近の対話内容:
+{context}
+
+対話の長さ分析:
+- 平均文字数: {length_analysis['average_length']:.0f}
+- 最近の傾向: {length_analysis['recent_trend']}
+- バランス: {length_analysis['balance']}
+- 現在の推奨: {length_analysis['recommendation']}
+
+この対話を分析し、介入の必要性を自発的に判断してください。
+特に応答が冗長または短すぎる場合は、長さ調整の介入を検討してください。
+
+回答は必ず以下のJSON形式で:
+{{
+    "intervention_needed": true/false,
+    "reason": "判断理由",
+    "intervention_type": "質問投げかけ|要約|方向転換|深掘り|激励|仲裁|長さ調整|なし",
+    "message": "介入する場合のメッセージ",
+    "response_length_guide": "簡潔|標準|詳細|現状維持",
+    "confidence": 0.0-1.0
+}}
+"""
     
     def _format_dialogue_context(self, dialogue_context: List[Dict]) -> str:
         """対話履歴を文字列に整形"""
@@ -193,6 +336,27 @@ class AutonomousDirector:
             self.current_phase = "convergence"
         else:
             self.current_phase = "synthesis"
+    
+    def generate_length_instruction(self, target_length: str = "標準") -> str:
+        """
+        応答長の指示を生成
+        
+        Args:
+            target_length: "簡潔", "標準", "詳細"
+            
+        Returns:
+            エージェントへの長さ指示文字列
+        """
+        if target_length not in self.prompts.get("response_length_guidelines", {}):
+            target_length = "標準"
+        
+        guideline = self.prompts["response_length_guidelines"][target_length]
+        
+        return f"""
+【応答の長さについて】
+{guideline['instruction']}
+目安: {guideline['sentences']}
+"""
     
     def get_intervention_stats(self) -> Dict:
         """介入統計を取得（分析用）"""

@@ -303,6 +303,20 @@ with st.sidebar:
                 help="低めを推奨（判断の一貫性のため）"
             )
         
+        st.markdown("**応答長制御**")
+        response_length_mode = st.select_slider(
+            "基本の応答長",
+            options=["簡潔", "標準", "詳細"],
+            value="標準",
+            help="Director が状況に応じて調整します"
+        )
+        
+        auto_length_balance = st.checkbox(
+            "自動長さバランス調整",
+            value=True,
+            help="Director が応答長のバランスを自動で調整"
+        )
+        
         enable_director = st.checkbox("Director介入を有効化", value=True)
         
         # モデル再読み込みボタン
@@ -323,6 +337,16 @@ with st.sidebar:
             st.metric("総介入回数", stats.get('total', 0))
         with col2:
             st.metric("現在ターン", st.session_state.current_turn)
+        
+        # 長さ分析情報
+        if hasattr(st.session_state.dialogue_manager.director, 'length_history'):
+            if st.session_state.dialogue_manager.director.length_history:
+                latest_length = st.session_state.dialogue_manager.director.length_history[-1]
+                st.metric(
+                    "平均応答長",
+                    f"{latest_length.get('average', 0):.0f}文字",
+                    help=f"傾向: {latest_length.get('trend', '不明')}"
+                )
         
         if stats.get('by_type'):
             st.markdown("**介入タイプ別**")
@@ -365,6 +389,10 @@ with col_main:
             )
             st.session_state.dialogue_manager.enable_director = enable_director
             st.session_state.dialogue_manager.max_turns = max_turns
+            
+            # 長さ制御設定をDirectorに反映
+            if auto_length_balance:
+                st.session_state.dialogue_manager.director.target_length = response_length_mode
             
             st.session_state.dialogue_history = []
             st.session_state.is_running = True
