@@ -293,31 +293,47 @@ class DialogueManager:
         return False
     
     def _apply_director_intervention(self, next_speaker: Agent, intervention: Dict):
-        """Director の介入を次の発言者に適用"""
+        """Director の介入を次の発言者に適用（長さ指示を含む）"""
         instruction = intervention.get('message', '')
         intervention_type = intervention.get('intervention_type', '')
+        response_length_guide = intervention.get('response_length_guide', '標準')
+        
+        # 長さ指示を生成
+        length_instruction = self.director.generate_length_instruction(response_length_guide)
         
         # 介入タイプに応じた指示を生成
-        if intervention_type == "質問投げかけ":
+        if intervention_type == "長さ調整":
             next_speaker.add_directive(
-                f"Directorからの質問を考慮してください: {instruction}",
-                ["新しい視点を提供", "質問に答える"]
+                f"{instruction}\n{length_instruction}",
+                ["応答の長さを調整", f"{response_length_guide}で応答"]
+            )
+        elif intervention_type == "質問投げかけ":
+            next_speaker.add_directive(
+                f"Directorからの質問を考慮してください: {instruction}\n{length_instruction}",
+                ["新しい視点を提供", "質問に答える", f"{response_length_guide}で応答"]
             )
         elif intervention_type == "要約":
             next_speaker.add_directive(
-                "これまでの議論を踏まえて、発展的な意見を述べてください",
-                ["要約を活用", "次のステップを提案"]
+                f"これまでの議論を踏まえて、発展的な意見を述べてください\n{length_instruction}",
+                ["要約を活用", "次のステップを提案", f"{response_length_guide}で応答"]
             )
         elif intervention_type == "方向転換":
             next_speaker.add_directive(
-                instruction,
-                ["新しい角度から", "視点を変えて"]
+                f"{instruction}\n{length_instruction}",
+                ["新しい角度から", "視点を変えて", f"{response_length_guide}で応答"]
             )
         elif intervention_type == "深掘り":
             next_speaker.add_directive(
-                f"この点を深く掘り下げてください: {instruction}",
-                ["具体例を挙げる", "詳細に説明"]
+                f"この点を深く掘り下げてください: {instruction}\n{length_instruction}",
+                ["具体例を挙げる", "詳細に説明", f"{response_length_guide}で応答"]
             )
+        else:
+            # その他の介入でも長さ指示を追加
+            if response_length_guide != "現状維持":
+                next_speaker.add_directive(
+                    length_instruction,
+                    [f"{response_length_guide}で応答"]
+                )
     
     async def run_dialogue(self, max_turns: Optional[int] = None) -> List[Dict]:
         """
