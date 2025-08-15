@@ -286,14 +286,130 @@ class DialogueController:
         }
     
     def _update_agent_instructions(self, intervention: Dict[str, Any]) -> None:
-        """エージェントへの指示を更新"""
-        # 次の話者を取得
-        next_speaker = self._get_next_speaker()
-        if next_speaker in self.agents:
-            self.agents[next_speaker].add_directive(
-                instruction=intervention.get("message", ""),
-                attention_points=["建設的な議論を心がける"]
+        """エージェントへの指示を更新
+        - 介入JSON（文字列）を解析し、人が読みやすい日本語の指示へ変換
+        - 指定話者（A/B）が含まれていれば、そのエージェントに適用
+        """
+        raw = intervention.get("message", "")
+        plan = None
+        if isinstance(raw, str):
+            # JSONであれば辞書化
+            try:
+                plan = json.loads(raw)
+            except Exception:
+                plan = None
+        elif isinstance(raw, dict):
+            plan = raw
+
+        # 指示文と注意点を生成
+        instruction_text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+        attention_points: List[str] = ["建設的な議論を心がける"]
+        target_agent_key = self._get_next_speaker()
+
+        if plan and isinstance(plan, dict):
+            ts = plan.get("turn_style", {})
+            length = ts.get("length", {})
+            preface = ts.get("preface", {})
+            bans = ts.get("ban", []) or []
+            speech_act = ts.get("speech_act", "")
+            follow_up = ts.get("follow_up", "")
+            label = ts.get("speaker")
+
+            # 指定話者があれば A/B を実エージェントにマップ
+            if label in ("A", "B"):
+                mapped = self._map_label_to_agent_key(label)
+                if mapped:
+                    target_agent_key = mapped
+
+            # 自然言語の指示を合成
+            max_chars = length.get("max_chars")
+            max_sent = length.get("max_sentences")
+            aizuchi_on = preface.get("aizuchi")
+            aizuchi_list = preface.get("aizuchi_list") or []
+
+            nl_parts: List[str] = []
+            # 話法
+            if speech_act:
+                mapping = {
+                    "ask": "短く問いかける",
+                    "answer": "端的に答える",
+                    "reflect": "相手の趣旨を要約して返す",
+                    "agree_short": "一言で軽く同意する",
+                    "disagree_short": "穏やかに短く異議を述べる",
+                    "handoff": "相手に話を渡す",
+                }
+                nl_parts.append(f"話法: {mapping.get(speech_act, speech_act)}")
+            # 長さ
+            if max_chars or max_sent:
+                len_text = []
+                if max_chars:
+                    len_text.append(f"{max_chars}文字以内")
+                if max_sent:
+                    len_text.append(f"最大{max_sent}文")
+                nl_parts.append("応答の長さ: " + "・".join(len_text))
+                attention_points.append("簡潔")
+            # 相槌
+            if aizuchi_on:
+                ex = f"（例: {'、'.join(aizuchi_list)}）" if aizuchi_list else ""
+                nl_parts.append(f"冒頭に軽い相槌を添えてもよい{ex}")
+            # 禁止事項
+            if bans:
+                jp = {
+                    "praise": "過度な称賛",
+                    "long_intro": "長い前置き",
+                    "list_format": "箇条書き/リスト形式",
+                }
+                ban_list = [jp.get(b, b) for b in bans]
+                nl_parts.append("禁止: " + "・".join(ban_list))
+            # 追従
+            if follow_up == "none":
+                nl_parts.append("今回は質問は付けない")
+
+            instruction_text = "\n".join(nl_parts)
+
+            # 注意点（UI側で拾われる想定）
+            if max_chars or max_sent:
+                attention_points.append(
+                    f"長さ遵守: {(str(max_chars)+'文字以内') if max_chars else ''}{'・' if max_chars and max_sent else ''}{('最大'+str(max_sent)+'文') if max_sent else ''}"
+                )
+            if bans:
+                attention_points.append("禁止事項を守る")
+            if aizuchi_on and aizuchi_list:
+                attention_points.append(f"相槌可: {aizuchi_list[0]}")
+
+        # 対象エージェントへ適用
+        if target_agent_key in self.agents:
+            self.agents[target_agent_key].add_directive(
+                instruction=instruction_text,
+                attention_points=attention_points
             )
+
+    def _map_label_to_agent_key(self, label: str) -> Optional[str]:
+        """対話履歴から表示名の出現順を用いて A/B をエージェントキーにマップ"""
+        if label not in ("A", "B"):
+            return None
+        order_display: List[str] = []
+        if self.state and self.state.history:
+            for h in self.state.history:
+                role = h.get("role")
+                if role in self.agents:
+                    disp = self.agents[role].character.get("name", role)
+                    if disp not in order_display:
+                        order_display.append(disp)
+                if len(order_display) >= 2:
+                    break
+        # ディスプレイ名→キー
+        display_to_key = {self.agents[k].character.get("name", k): k for k in self.agents}
+        if not order_display:
+            # フォールバック: 登録順で A/B
+            keys = list(self.agents.keys())
+            return keys[0] if label == "A" else (keys[1] if len(keys) > 1 else keys[0])
+        first = order_display[0]
+        second = order_display[1] if len(order_display) > 1 else None
+        if label == "A":
+            return display_to_key.get(first)
+        else:
+            return display_to_key.get(second, display_to_key.get(first))
     
     def _get_current_speaker(self) -> str:
         """現在の話者を取得"""

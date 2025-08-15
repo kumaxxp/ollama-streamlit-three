@@ -1,422 +1,277 @@
 """
-Director AI - 自発的な介入判断を行う監督AI
-LLMの能力を最大限活用し、プログラム的制御を最小限に
+Director AI (v2) — Natural Conversation Director
+目的: 議論の正しさではなく、人間的な会話のリズム(長さ/相槌/切り返し)を最優先で制御する。
+- 介入は内容指図ではなく、テンポと尺と話法の指定(JSON)に限定する。
+- 既存AutonomousDirectorを下位互換で拡張。
+
+使用想定:
+  director = NaturalConversationDirector(ollama_client, model_name="qwen2.5:7b")
+  cmd = director.plan_next_turn(dialogue_context)
+  # cmd は turn_style/cadence/closing_hint を含む JSON(dict)
+  # これをそのまま Agent(A/B) に渡し、max_chars, max_sentences, aizuchi 等を実行させる。
 """
 
+from __future__ import annotations
 import json
 import logging
+import random
+import re
 from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-class AutonomousDirector:
-    """
-    自発的な判断と介入を行うDirector AI
-    プロンプトエンジニアリングによる高度な制御
-    """
-    
-    def __init__(self, ollama_client, model_name: str = "qwen2.5:7b"):
-        self.client = ollama_client
+# 短い相槌と禁止語/冗長句の辞書(運用で増やす)
+AIZUCHI_POOL = [
+    "うん", "なるほど", "たしかに", "へぇ", "ふむ", "そうか", "ええ", "あー", "うーん"
+]
+PRAISE_WORDS = [
+    "素晴らしい", "すごい", "勉強になります", "最高", "素敵", "称賛", "感謝します", "素晴らしかった"
+]
+LONG_INTRO_PAT = re.compile(r"^(ところで|まず|ちなみに|さて|えっと|あのー|まずは)[、,]\s*", re.UNICODE)
+LIST_MARKERS_PAT = re.compile(r"^(?:[-*・]|\d+\.)\s", re.MULTILINE)
+
+# KPI (会話の手触りを数値制約)
+TURN_CHAR_MIN = 28
+TURN_CHAR_MAX = 110
+TURN_CHAR_MEDIAN_TARGET = 60
+MAX_SENTENCES = 2
+QUESTION_RATIO_TARGET = (0.35, 0.55)
+AIZUCHI_PROB_DEFAULT = 0.4
+MAX_CONSECUTIVE_BY_SPEAKER = 2
+
+class NaturalConversationDirector:
+    """会話のテンポ/尺/相槌を制御するディレクター。内容判断を最小化。"""
+
+    def __init__(self, ollama_client=None, model_name: str = "qwen2.5:7b"):
+        self.client = ollama_client  # v2ではLLM依存を極小化(無くても動く)
         self.model_name = model_name
-        self.temperature = 0.3  # 一貫性重視
-        
-        # プロンプトテンプレートをJSONから読み込み
-        self.load_prompts()
-        
-        # 介入履歴（学習用）
-        self.intervention_history = []
-        self.current_phase = "exploration"
-        
-        # 長さ分析用の履歴
-        self.length_history = []
-        self.target_length = "標準"  # デフォルトは標準
-        
-    def load_prompts(self):
-        """Director用プロンプトをJSONから読み込み"""
-        try:
-            with open('config/director_prompts.json', 'r', encoding='utf-8') as f:
-                self.prompts = json.load(f)
-        except FileNotFoundError:
-            logger.warning("director_prompts.json not found, using defaults")
-            self.prompts = self._get_default_prompts()
-    
-    def _get_default_prompts(self) -> Dict:
-        """デフォルトプロンプト（フォールバック用）"""
-        return {
-            "system_prompt": "あなたは対話の監督者です。必要に応じて介入してください。",
-            "evaluation_prompt": "対話を評価し、介入の必要性を判断してください。"
+        self.temperature = 0.2
+        self.current_phase = "flow"  # flow→wrap
+        self.turn_counter = 0
+        # 検出した参加者名（会話ログの表示名）を A/B にマッピングするため保持
+        self.participants: List[str] = []  # [nameA, nameB]
+        # メトリクス
+        self.metrics = {
+            "avg_chars_last3": 0.0,
+            "question_ratio": 0.0,
+            "consecutive_by_last": 0,
+            "last_speaker": None,            # 表示名
+            "last_speaker_label": None,      # 'A' | 'B' | None
         }
-    
-    def analyze_response_lengths(self, dialogue_context: List[Dict]) -> Dict:
-        """
-        対話の長さを分析
-        
-        Returns:
-            {
-                "average_length": float,
-                "recent_trend": str,  # "increasing", "decreasing", "stable"
-                "balance": str,  # "balanced", "imbalanced"
-                "recommendation": str  # "簡潔", "標準", "詳細"
-            }
-        """
-        if not dialogue_context:
-            return {
-                "average_length": 0,
-                "recent_trend": "stable",
-                "balance": "balanced",
-                "recommendation": "標準"
-            }
-        
-        # 最近5ターンの長さを分析
-        recent_messages = dialogue_context[-5:] if len(dialogue_context) >= 5 else dialogue_context
-        
-        lengths = []
-        agent_lengths = {"agent1": [], "agent2": []}
-        
-        for entry in recent_messages:
-            if entry.get('speaker') != 'Director':
-                message = entry.get('message', '')
-                length = len(message)
-                lengths.append(length)
-                
-                # エージェント別に記録
-                speaker = entry.get('speaker', '')
-                if 'やな' in speaker or 'さくら' in speaker or '田中' in speaker:
-                    agent_lengths["agent1"].append(length)
-                else:
-                    agent_lengths["agent2"].append(length)
-        
-        if not lengths:
-            return {
-                "average_length": 0,
-                "recent_trend": "stable",
-                "balance": "balanced",
-                "recommendation": "標準"
-            }
-        
-        # 平均長さ
-        avg_length = sum(lengths) / len(lengths)
-        
-        # トレンド分析
-        if len(lengths) >= 3:
-            recent_avg = sum(lengths[-2:]) / 2
-            older_avg = sum(lengths[:-2]) / (len(lengths) - 2)
-            if recent_avg > older_avg * 1.3:
-                trend = "increasing"
-            elif recent_avg < older_avg * 0.7:
-                trend = "decreasing"
-            else:
-                trend = "stable"
-        else:
-            trend = "stable"
-        
-        # バランス分析
-        if agent_lengths["agent1"] and agent_lengths["agent2"]:
-            avg1 = sum(agent_lengths["agent1"]) / len(agent_lengths["agent1"])
-            avg2 = sum(agent_lengths["agent2"]) / len(agent_lengths["agent2"])
-            ratio = max(avg1, avg2) / min(avg1, avg2) if min(avg1, avg2) > 0 else 1
-            balance = "imbalanced" if ratio > 2 else "balanced"
-        else:
-            balance = "balanced"
-        
-        # 推奨を決定
-        if avg_length > 250:
-            recommendation = "簡潔"
-        elif avg_length < 80:
-            recommendation = "詳細"
-        else:
-            recommendation = "標準"
-        
-        # 履歴に追加
-        self.length_history.append({
-            "turn": len(dialogue_context),
-            "average": avg_length,
-            "trend": trend,
-            "balance": balance
-        })
-        
-        return {
-            "average_length": avg_length,
-            "recent_trend": trend,
-            "balance": balance,
-            "recommendation": recommendation
-        }
-    
-    async def evaluate_dialogue(self, dialogue_context: List[Dict]) -> Dict:
-        """
-        対話を評価し、自発的に介入を判断（長さ制御を含む）
-        
-        Returns:
-            {
-                "intervention_needed": bool,
-                "reason": str,
-                "intervention_type": str,
-                "message": str,
-                "response_length_guide": str,
-                "confidence": float
-            }
-        """
-        # 長さ分析を実行
-        length_analysis = self.analyze_response_lengths(dialogue_context)
-        
-        # 最近の対話を文脈として整形
-        context_str = self._format_dialogue_context(dialogue_context)
-        
-        # 評価プロンプト構築（長さ情報を含む）
-        evaluation_prompt = self._build_evaluation_prompt_with_length(
-            context_str, 
-            length_analysis
-        )
-        
-        try:
-            # LLMによる自発的判断
-            response = self.client.chat(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": self.prompts["system_prompt"]},
-                    {"role": "user", "content": evaluation_prompt}
-                ],
-                options={
-                    "temperature": self.temperature,
-                    "top_p": 0.9,
-                    "seed": 42  # 再現性のため
+
+    # ===== 公開API =====
+    def plan_next_turn(self, dialogue_context: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """直近ログからテンポ指示JSONを生成する(LLM不要)。"""
+        self.turn_counter += 1
+        stats = self._analyze(dialogue_context)
+        speaker = self._pick_speaker(stats)
+        speech_act = self._pick_speech_act(stats)
+        max_chars = self._decide_max_chars(stats)
+        aizuchi = self._decide_aizuchi(stats)
+        closing_hint = self._decide_closing(stats)
+
+        cmd = {
+            "turn_style": {
+                "speaker": speaker,
+                "length": {"max_chars": max_chars, "max_sentences": MAX_SENTENCES},
+                "preface": {
+                    "aizuchi": aizuchi["on"],
+                    "aizuchi_list": [aizuchi["word"]] if aizuchi["on"] else [],
+                    "prob": aizuchi["prob"],
                 },
-                format="json"
-            )
-            
-            # レスポンスをパース
-            result = json.loads(response['message']['content'])
-            
-            # 長さガイドが含まれていない場合はデフォルト値を設定
-            if "response_length_guide" not in result:
-                result["response_length_guide"] = length_analysis["recommendation"]
-            
-            # 現在の目標長さを更新
-            self.target_length = result.get("response_length_guide", "標準")
-            
-            # 介入履歴に記録（学習用）
-            if result.get("intervention_needed", False):
-                self.intervention_history.append({
-                    "timestamp": datetime.now().isoformat(),
-                    "type": result.get("intervention_type"),
-                    "reason": result.get("reason"),
-                    "phase": self.current_phase,
-                    "length_guide": result.get("response_length_guide")
-                })
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"Director evaluation error: {e}")
-            return {
-                "intervention_needed": False,
-                "reason": "評価エラー",
-                "intervention_type": "none",
-                "message": "",
-                "response_length_guide": "標準",
-                "confidence": 0.0
-            }
-    
-    def _build_evaluation_prompt_with_length(self, context: str, length_analysis: Dict) -> str:
-        """長さ情報を含む評価プロンプトの構築"""
-        return f"""
-現在の対話フェーズ: {self.current_phase}
-
-最近の対話内容:
-{context}
-
-対話の長さ分析:
-- 平均文字数: {length_analysis['average_length']:.0f}
-- 最近の傾向: {length_analysis['recent_trend']}
-- バランス: {length_analysis['balance']}
-- 現在の推奨: {length_analysis['recommendation']}
-
-この対話を分析し、介入の必要性を自発的に判断してください。
-特に応答が冗長または短すぎる場合は、長さ調整の介入を検討してください。
-
-回答は必ず以下のJSON形式で:
-{{
-    "intervention_needed": true/false,
-    "reason": "判断理由",
-    "intervention_type": "質問投げかけ|要約|方向転換|深掘り|激励|仲裁|長さ調整|なし",
-    "message": "介入する場合のメッセージ",
-    "response_length_guide": "簡潔|標準|詳細|現状維持",
-    "confidence": 0.0-1.0
-}}
-"""
-    
-    def _format_dialogue_context(self, dialogue_context: List[Dict]) -> str:
-        """対話履歴を文字列に整形"""
-        if not dialogue_context:
-            return "（対話開始）"
-        
-        # 最新5ターンまでを取得
-        recent = dialogue_context[-5:]
-        formatted = []
-        
-        for entry in recent:
-            speaker = entry.get('speaker', '不明')
-            listener = entry.get('listener', '相手')
-            message = entry.get('message', '')
-            
-            # Director介入は別形式で表示
-            if speaker == 'Director':
-                formatted.append(f"[監督介入] {message}")
-            else:
-                formatted.append(f"{speaker} → {listener}: 「{message}」")
-        
-        return "\n".join(formatted)
-    
-    def _build_evaluation_prompt(self, context: str) -> str:
-        """評価用プロンプトの構築"""
-        return f"""
-現在の対話フェーズ: {self.current_phase}
-
-最近の対話内容:
-{context}
-
-この対話を分析し、介入の必要性を自発的に判断してください。
-あなたの判断基準に従って、最適な行動を選択してください。
-
-回答は必ず以下のJSON形式で:
-{{
-    "intervention_needed": true/false,
-    "reason": "判断理由",
-    "intervention_type": "質問投げかけ|要約|方向転換|深掘り|激励|なし",
-    "message": "介入する場合のメッセージ（相手を意識した自然な日本語で）",
-    "confidence": 0.0-1.0の確信度
-}}
-"""
-    
-    def generate_opening_instruction(self, theme: str, agent_name: str) -> Dict:
-        """
-        対話開始時の指示生成
-        """
-        prompt = f"""
-テーマ「{theme}」について、{agent_name}が最初の発言をします。
-このエージェントへの効果的な開始指示を生成してください。
-
-以下のJSON形式で回答:
-{{
-    "instruction": "具体的な指示",
-    "tone": "推奨トーン（casual/formal/passionate等）",
-    "focus_points": ["注目すべきポイント1", "ポイント2"]
-}}
-"""
-        
-        try:
-            response = self.client.chat(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": self.prompts.get("instruction_system", "")},
-                    {"role": "user", "content": prompt}
-                ],
-                options={"temperature": 0.5},
-                format="json"
-            )
-            
-            return json.loads(response['message']['content'])
-            
-        except Exception as e:
-            logger.error(f"Opening instruction generation error: {e}")
-            return {
-                "instruction": f"{theme}について、あなたの視点から話を始めてください",
-                "tone": "natural",
-                "focus_points": ["自分の経験", "率直な意見"]
-            }
-    
-    def update_phase(self, turn_count: int):
-        """対話フェーズの更新"""
-        if turn_count < 5:
-            self.current_phase = "exploration"
-        elif turn_count < 10:
-            self.current_phase = "deepening"
-        elif turn_count < 15:
-            self.current_phase = "convergence"
-        else:
-            self.current_phase = "synthesis"
-    
-    def generate_length_instruction(self, target_length: str = "標準") -> str:
-        """
-        応答長の指示を生成
-        
-        Args:
-            target_length: "簡潔", "標準", "詳細"
-            
-        Returns:
-            エージェントへの長さ指示文字列
-        """
-        if target_length not in self.prompts.get("response_length_guidelines", {}):
-            target_length = "標準"
-        
-        guideline = self.prompts["response_length_guidelines"][target_length]
-        
-        return f"""
-【応答の長さについて】
-{guideline['instruction']}
-目安: {guideline['sentences']}
-"""
-    
-    def get_intervention_stats(self) -> Dict:
-        """介入統計を取得（分析用）"""
-        if not self.intervention_history:
-            return {"total": 0, "by_type": {}, "by_phase": {}}
-        
-        stats = {
-            "total": len(self.intervention_history),
-            "by_type": {},
-            "by_phase": {}
+                "speech_act": speech_act,  # ask|answer|reflect|agree_short|disagree_short|handoff
+                "follow_up": "ask_feel" if speech_act == "ask" else "none",
+                "ban": ["praise", "long_intro", "list_format"],
+            },
+            "cadence": {
+                "avoid_consecutive_monologues": True,
+                "enforce_question_ratio": list(QUESTION_RATIO_TARGET),
+            },
+            "closing_hint": closing_hint,
         }
-        
-        for intervention in self.intervention_history:
-            # タイプ別集計
-            itype = intervention.get("type", "unknown")
-            stats["by_type"][itype] = stats["by_type"].get(itype, 0) + 1
-            
-            # フェーズ別集計
-            phase = intervention.get("phase", "unknown")
-            stats["by_phase"][phase] = stats["by_phase"].get(phase, 0) + 1
-        
-        return stats
-    
-    def should_end_dialogue(self, dialogue_context: List[Dict], turn_count: int) -> Tuple[bool, str]:
-        """
-        対話終了判断（LLMによる自発的判断）
-        """
-        if turn_count < 10:  # 最低ターン数
-            return False, ""
-        
-        context_str = self._format_dialogue_context(dialogue_context[-10:])
-        
-        prompt = f"""
-以下の対話が十分な結論に達したか、または継続が困難か判断してください。
+        return cmd
 
-対話内容（最新10ターン）:
-{context_str}
+    # ===== 下位互換API: フェーズ更新とオープニング指示 =====
+    def update_phase(self, turn_count: int) -> None:
+        """既存コード互換: ターン数に応じて内部フェーズを更新する。"""
+        # シンプルな閾値で wrap へ移行（必要に応じて調整）
+        self.current_phase = "wrap" if turn_count >= 16 else "flow"
 
-現在のターン数: {turn_count}
+    def generate_opening_instruction(self, theme: str, first_speaker_name: str) -> Dict[str, Any]:
+        """既存コード互換: 最初の話者向けの開始指示を返す。"""
+        instruction = (
+            f"テーマ『{theme}』について、挨拶は省き、自然な導入で短く語り始めてください。"
+            f" 相手（{first_speaker_name}の相手）が反応しやすい、具体的で一文～二文の投げかけを含めてください。"
+            " 箇条書きは使わず、会話文で。"
+        )
+        focus_points = [
+            "簡潔 (50-90文字)",
+            "相手が返しやすい問いかけを添える",
+            "挨拶や自己紹介はしない",
+            "リスト/見出し/絵文字を使わない",
+        ]
+        return {"instruction": instruction, "focus_points": focus_points}
 
-以下のJSON形式で回答:
-{{
-    "should_end": true/false,
-    "reason": "終了/継続の理由"
-}}
-"""
-        
-        try:
-            response = self.client.chat(
-                model=self.model_name,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ],
-                options={"temperature": 0.3},
-                format="json"
-            )
-            
-            result = json.loads(response['message']['content'])
-            return result.get("should_end", False), result.get("reason", "")
-            
-        except Exception as e:
-            logger.error(f"End dialogue evaluation error: {e}")
-            return False, ""
+    # ===== 内部: 分析 =====
+    def _analyze(self, dialogue_context: List[Dict[str, Any]]) -> Dict[str, Any]:
+        last3 = [m for m in dialogue_context if m.get("speaker") != "Director"][-3:]
+        chars = [len(m.get("message", "")) for m in last3]
+        avg_chars_last3 = sum(chars)/len(chars) if chars else 0
+
+        # 質問検出: 末尾? or 疑問語を含む
+        def is_question(text: str) -> bool:
+            return text.strip().endswith("？") or any(q in text for q in ["？", "?", "どう思う", "なぜ", "理由", "どこ", "いつ", "だれ", "何"])
+        last10 = [m for m in dialogue_context if m.get("speaker") != "Director"][-10:]
+        q_cnt = sum(1 for m in last10 if is_question(m.get("message", "")))
+        question_ratio = (q_cnt/len(last10)) if last10 else 0.0
+
+        # 連続独演
+        # 参加者名を検出して固定（先に登場した2名を参加者とする）
+        if dialogue_context:
+            names: List[str] = []
+            for m in dialogue_context:
+                s = m.get("speaker")
+                if s and s != "Director" and s not in names:
+                    names.append(s)
+                if len(names) >= 2:
+                    break
+            if names:
+                # 既存 participants を温存しつつ更新
+                if not self.participants:
+                    self.participants = names[:2]
+                else:
+                    # 不足があれば補完
+                    for n in names:
+                        if n not in self.participants and len(self.participants) < 2:
+                            self.participants.append(n)
+
+        last_speaker = self.metrics["last_speaker"]
+        current_last = last3[-1]["speaker"] if last3 else None
+        if current_last == last_speaker and current_last is not None:
+            consecutive = self.metrics["consecutive_by_last"] + 1
+        else:
+            consecutive = 1
+        # A/B ラベルに正規化
+        last_label = None
+        if current_last:
+            last_label = self._label_of(current_last)
+        # 更新
+        self.metrics.update({
+            "avg_chars_last3": avg_chars_last3,
+            "question_ratio": question_ratio,
+            "consecutive_by_last": consecutive,
+            "last_speaker": current_last,
+            "last_speaker_label": last_label,
+        })
+        return dict(self.metrics)
+
+    # ===== 内部: 方針決定 =====
+    def _pick_speaker(self, stats: Dict[str, Any]) -> str:
+        # 連続独演を禁止
+        if stats["consecutive_by_last"] >= MAX_CONSECUTIVE_BY_SPEAKER and (stats.get("last_speaker_label") or stats.get("last_speaker")):
+            return self._other(stats.get("last_speaker_label") or stats.get("last_speaker"))  # 強制交代
+        # 基本は交互
+        return self._other(stats.get("last_speaker_label") or stats.get("last_speaker")) if stats.get("last_speaker") else "A"
+
+    def _pick_speech_act(self, stats: Dict[str, Any]) -> str:
+        lo, hi = QUESTION_RATIO_TARGET
+        if stats["question_ratio"] < lo:
+            return "ask"
+        # 長尺が続くなら短い相づち系
+        if stats["avg_chars_last3"] > 90:
+            return random.choice(["reflect", "agree_short", "handoff"])
+        return random.choice(["answer", "reflect", "agree_short", "disagree_short"])
+
+    def _decide_max_chars(self, stats: Dict[str, Any]) -> int:
+        if stats["avg_chars_last3"] > 90:
+            return 70
+        if stats["avg_chars_last3"] < 40:
+            return 90  # 少し伸ばす
+        return 80  # デフォルト
+
+    def _decide_aizuchi(self, stats: Dict[str, Any]) -> Dict[str, Any]:
+        on = random.random() < AIZUCHI_PROB_DEFAULT
+        return {"on": on, "word": random.choice(AIZUCHI_POOL), "prob": AIZUCHI_PROB_DEFAULT}
+
+    def _decide_closing(self, stats: Dict[str, Any]) -> str:
+        # 単純規則: ターンが進み、質問比率が閾値内で、新情報が減ってきたら締めに寄せる
+        if self.turn_counter >= 14 and QUESTION_RATIO_TARGET[0] <= stats["question_ratio"] <= QUESTION_RATIO_TARGET[1]:
+            return "小まとめして交代"
+        if self.turn_counter >= 18:
+            return "締めに向かう"
+        return "続ける"
+
+    def _other(self, s: Optional[str]) -> str:
+        """与えられた話者（表示名または 'A'/'B'）の反対側ラベルを返す。"""
+        if s is None:
+            return "A"
+        label = s
+        if s not in ("A", "B"):
+            label = self._label_of(s)
+        return "B" if label == "A" else "A"
+
+    def _label_of(self, name: str) -> str:
+        """表示名から 'A' または 'B' を返す（未知は 'A'）。"""
+        if not name:
+            return "A"
+        if self.participants:
+            if len(self.participants) >= 1 and name == self.participants[0]:
+                return "A"
+            if len(self.participants) >= 2 and name == self.participants[1]:
+                return "B"
+        # 不明な名前の場合は A を既定に
+        return "A"
+
+    # ===== 参考: 既存 evaluate_dialogue の互換API(必要なら使用) =====
+    async def evaluate_dialogue(self, dialogue_context: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """下位互換: 旧API呼び出し箇所のための非同期関数。v2では turn_style を返す。"""
+        cmd = self.plan_next_turn(dialogue_context)
+        return {
+            "intervention_needed": True,
+            "reason": "rhythm_control",
+            "intervention_type": "length_tempo_speech_act",
+            "message": json.dumps(cmd, ensure_ascii=False),  # 互換のため文字列化
+            "response_length_guide": "簡潔",
+            "confidence": 0.8,
+        }
+
+    # ===== Judgeユーティリティ(任意) =====
+    @staticmethod
+    def judge_text(text: str, max_chars: int = TURN_CHAR_MAX, max_sentences: int = MAX_SENTENCES) -> Dict[str, Any]:
+        violations = []
+        # 長さ
+        if len(text) > max_chars:
+            violations.append("too_long")
+        # 文数
+        sentences = re.split(r"[。.!?？！]+", text.strip())
+        sentences = [s for s in sentences if s]
+        if len(sentences) > max_sentences:
+            violations.append("too_many_sentences")
+        # リスト
+        if LIST_MARKERS_PAT.search(text):
+            violations.append("list_detected")
+        # 称賛
+        if any(w in text for w in PRAISE_WORDS):
+            violations.append("praise_used")
+        # 冗長書き出し
+        if LONG_INTRO_PAT.search(text):
+            violations.append("long_intro")
+        return {"ok": not violations, "violations": violations}
+
+    @staticmethod
+    def auto_repair(text: str, max_chars: int = 90) -> str:
+        # 冗長導入句を削除
+        text = LONG_INTRO_PAT.sub("", text)
+        # 箇条書き記号を削除
+        text = re.sub(r"^(?:[-*・]|\d+\.)\s*", "", text, flags=re.MULTILINE)
+        # 称賛語を中立語に置換
+        for w in PRAISE_WORDS:
+            text = text.replace(w, "(省略)")
+        # 末尾刈り
+        if len(text) > max_chars:
+            text = text[:max_chars].rstrip("、, ")
+        return text
+
+# 既存クラス名に合わせたエイリアス(置換コスト最小化)
+AutonomousDirector = NaturalConversationDirector
