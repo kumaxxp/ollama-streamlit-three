@@ -25,16 +25,27 @@ conda activate ollama-chat
 ## 🏗️ プロジェクト構造
 
 ```
-ollama-streamlit-chat/
-├── app/                    # メインアプリケーション
-│   ├── simple_chat.py     # 基本チャット機能
-│   └── pages/             # マルチページ機能
-├── config/                # 設定ファイル
-│   ├── models.yaml        # モデル設定
-│   └── characters/        # キャラクター定義
-├── utils/                 # ユーティリティ
-├── data/                  # データ保存
-└── scripts/               # 便利スクリプト
+ollama-streamlit-three/
+├── app/
+│   ├── core/                       # コアロジック（Agent/Director/Model管理など）
+│   ├── ui/                         # UIヘルパー
+│   └── pages/                      # Streamlitページ
+│       ├── 01_Simple_Chat.py
+│       └── 03_Advanced_Dialogue_Refactored.py
+├── config/                         # 設定ファイル（単一ソース）
+│   ├── model_config.json           # モデル優先度/推奨温度/デフォルト
+│   ├── characters.json             # キャラクター定義
+│   ├── strategies.json             # 対話戦略
+│   ├── prompt_templates.json       # プロンプトテンプレート
+│   └── director_prompts.json       # Director用プロンプト
+├── scripts/
+│   └── install_models.py           # 推奨モデルの自動インストーラ
+├── data/
+│   └── dialogues/                  # 会話ログ
+├── tests/                          # 最低限のテスト
+├── run_app.sh                      # 高機能ページの起動スクリプト
+├── setup_and_run.sh                # セットアップ＆起動ランチャ
+└── QUICKSTART.md                   # クイックスタート
 ```
 
 
@@ -50,6 +61,33 @@ ollama-streamlit-chat/
 | **gemma3:4b** | Director AI | 3.3GB | 軽量で高速な判断、低レイテンシ |
 | **gemma3:12b** | 高品質エージェント | 8.1GB | より複雑な議論や推論が必要な場合 |
 | **gpt-oss:20b** | 創造的対話 | 13GB | 高品質な文章生成、創造的なタスク |
+
+### モデルの自動インストール（推奨）
+
+config/model_config.json を単一のソースとして参照し、推奨モデルを自動でインストールできます。
+
+```bash
+# Conda 環境を有効化
+conda activate ollama-chat
+
+# インストール計画の確認
+python scripts/install_models.py --list --include-defaults
+
+# 推奨モデルをインストール（既にあるモデルはスキップ）
+python scripts/install_models.py --pull --include-defaults --skip-available
+
+# 例: すべての推奨グループを取得（primary + lightweight 以外も含める）
+python scripts/install_models.py --pull --groups all --skip-available
+
+# 例: 個別に追加インストール
+python scripts/install_models.py --pull --names gemma3:12b gpt-oss:20b
+```
+
+補足: 対話式スクリプトからの自動モードも利用できます。
+
+```bash
+./install_models.sh    # メニューで「Auto (recommended)」を選択
+```
 
 ### インストール（必須）
 ```bash
@@ -111,8 +149,8 @@ python check_models.py
 ### 1. リポジトリのクローン
 
 ```bash
-git clone https://github.com/yourusername/ollama-streamlit-chat.git
-cd ollama-streamlit-chat
+git clone https://github.com/kumaxxp/ollama-streamlit-three.git
+cd ollama-streamlit-three
 ```
 
 ### 2. 自動セットアップ（推奨）
@@ -143,19 +181,22 @@ pip install -r requirements.txt
 # Ollamaサービス起動
 sudo systemctl start ollama
 
-# モデルのダウンロード
-ollama pull qwen2.5:7b
+# モデルのダウンロード（最小構成）
+ollama pull qwen2.5:7b-instruct-q4_K_M
 ollama pull gemma3:4b
 ```
 
 #### アプリケーション起動
 
 ```bash
-# シンプル版
-streamlit run app/simple_chat.py
+# シンプル版（単一ページ）
+streamlit run app/pages/01_Simple_Chat.py
 
-# マルチページ版（フル機能）
-streamlit run app/advanced_chat.py
+# 高機能版（Advanced Dialogue）
+streamlit run app/pages/03_Advanced_Dialogue_Refactored.py
+
+# またはスクリプトから起動
+./run_app.sh
 ```
 
 ## 💻 使い方
@@ -182,22 +223,30 @@ streamlit run app/advanced_chat.py
 }
 ```
 
-#### モデル設定
+#### モデル設定（単一ソース: config/model_config.json）
 
-```yaml
-# config/models.yaml
-models:
-  qwen2.5:
-    version: "7b"
-    context_size: 32768
-    gpu_layers: 35
-    temperature_default: 0.7
-    
-  gemma3:
-    version: "4b"
-    context_size: 8192
-    gpu_layers: 28
-    temperature_default: 0.8
+```json
+{
+  "default_models": {
+    "agent": "qwen2.5:7b-instruct-q4_K_M",
+    "director": "gemma3:4b",
+    "fallback": "qwen:7b"
+  },
+  "model_selection_rules": {
+    "dialogue_agent": { "preferred_models": ["qwen2.5:7b-instruct-q4_K_M", "gemma3:12b"], "recommended_temperature": 0.7 },
+    "director": { "preferred_models": ["gemma3:4b", "qwen2.5:7b-instruct-q4_K_M"], "recommended_temperature": 0.3 }
+  },
+  "production_models": {
+    "primary": [
+      { "name": "qwen2.5:7b-instruct-q4_K_M", "priority": 1, "temperature": { "agent": 0.7 } },
+      { "name": "gemma3:4b", "priority": 2, "temperature": { "director": 0.3 } }
+    ],
+    "extended": [
+      { "name": "gemma3:12b", "priority": 10 },
+      { "name": "gpt-oss:20b", "priority": 20 }
+    ]
+  }
+}
 ```
 
 ## 📊 パフォーマンス
@@ -300,8 +349,8 @@ sudo swapon /swapfile
 
 ## 📧 連絡先
 
-- Issue: [GitHub Issues](https://github.com/yourusername/ollama-streamlit-chat/issues)
-- Discussion: [GitHub Discussions](https://github.com/yourusername/ollama-streamlit-chat/discussions)
+- Issue: https://github.com/kumaxxp/ollama-streamlit-three/issues
+- Discussion: https://github.com/kumaxxp/ollama-streamlit-three/discussions
 
 ---
 

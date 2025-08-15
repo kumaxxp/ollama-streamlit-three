@@ -20,6 +20,17 @@ if %errorlevel% neq 0 (
 echo ✅ Ollamaが起動しています
 echo.
 
+echo インストール方法を選択してください:
+echo 1) 自動 (推奨) - configに基づく一括インストール
+echo 2) 手動 - 対話形式でモデル選択 (従来方式)
+echo 0) 終了
+echo.
+set /p mode="選択 (0-2): "
+
+if "%mode%"=="1" goto auto
+if "%mode%"=="0" goto end
+
+echo.
 echo インストールレベルを選択してください:
 echo 1) 最小構成 (VRAM 6GB) - 必須モデルのみ
 echo 2) 標準構成 (VRAM 10GB) - 推奨モデル
@@ -35,6 +46,17 @@ if "%choice%"=="3" goto full
 if "%choice%"=="4" goto custom
 if "%choice%"=="0" goto end
 goto invalid
+
+:auto
+echo.
+echo 🧠 config/model_config.json に基づいて一括インストールします (Pythonラッパー)
+echo     例) python scripts\install_models.py --pull --include-defaults --skip-available
+python scripts\install_models.py --pull --include-defaults --skip-available
+if %errorlevel% neq 0 (
+    echo ⚠️ Pythonインストーラーに失敗したため、手動モードに切り替えます。
+    goto standard
+)
+goto complete
 
 :minimal
 echo.
@@ -141,7 +163,7 @@ ollama list
 echo.
 echo 次のステップ:
 echo   python check_models.py  (モデル確認)
-echo   streamlit run app/pages/03_Advanced_Dialogue.py  (アプリ起動)
+echo   streamlit run app/pages/03_Advanced_Dialogue_Refactored.py  (アプリ起動)
 echo ==========================================
 pause
 goto end

@@ -137,7 +137,9 @@ show_menu() {
             fi
             ;;
         2)
-            if [ -f "app/pages/03_Advanced_Dialogue.py" ]; then
+            if [ -f "app/pages/03_Advanced_Dialogue_Refactored.py" ]; then
+                streamlit run app/pages/03_Advanced_Dialogue_Refactored.py
+            elif [ -f "app/pages/03_Advanced_Dialogue.py" ]; then
                 streamlit run app/pages/03_Advanced_Dialogue.py
             else
                 echo -e "${RED}Advanced Dialogueが見つかりません${NC}"
@@ -147,6 +149,8 @@ show_menu() {
             # メインファイルを探す
             if [ -f "app/pages/01_Simple_Chat.py" ]; then
                 streamlit run app/pages/01_Simple_Chat.py
+            elif [ -f "app/pages/03_Advanced_Dialogue_Refactored.py" ]; then
+                streamlit run app/pages/03_Advanced_Dialogue_Refactored.py
             elif [ -f "app/pages/03_Advanced_Dialogue.py" ]; then
                 streamlit run app/pages/03_Advanced_Dialogue.py
             else

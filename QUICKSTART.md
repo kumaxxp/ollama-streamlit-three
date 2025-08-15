@@ -7,6 +7,19 @@
 
 ## 🎯 推奨モデルセットアップ
 
+### まずは自動インストール（推奨）
+config/model_config.json に基づいて推奨モデルを一括インストールできます。
+
+```bash
+# 計画の確認
+python scripts/install_models.py --list --include-defaults
+
+# 推奨モデルの取得（既存はスキップ）
+python scripts/install_models.py --pull --include-defaults --skip-available
+```
+
+手動で進めたい場合は、以下のステップに従ってください。
+
 ### ステップ1: Ollamaの確認
 ```bash
 # Ollamaが起動しているか確認
@@ -52,7 +65,7 @@ python check_models.py
 ### ステップ4: アプリケーション起動
 ```bash
 # Streamlitアプリを起動
-streamlit run app/pages/03_Advanced_Dialogue.py
+streamlit run app/pages/03_Advanced_Dialogue_Refactored.py
 ```
 
 ## 🎭 モデル選択ガイド

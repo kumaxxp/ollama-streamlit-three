@@ -213,7 +213,7 @@ def main():
             interactive_download()
     
     print("\n✨ 確認完了！")
-    print("Streamlitアプリを起動: streamlit run app/pages/03_Advanced_Dialogue.py")
+    print("Streamlitアプリを起動: streamlit run app/pages/03_Advanced_Dialogue_Refactored.py")
 
 if __name__ == "__main__":
     main()

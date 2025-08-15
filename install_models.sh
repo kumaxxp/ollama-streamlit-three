@@ -40,10 +40,37 @@ install_model() {
     fi
 }
 
+run_python_installer() {
+    if command -v python >/dev/null 2>&1; then
+        echo ""
+        echo "🧠 config/model_config.json に基づいて一括インストールします (Pythonラッパー)"
+        echo "    例) python scripts/install_models.py --pull --include-defaults --skip-available"
+        echo ""
+        python scripts/install_models.py --pull --include-defaults --skip-available
+        return $?
+    fi
+    return 1
+}
+
 # メイン処理
 main() {
     check_ollama
-    
+
+    echo ""
+    echo "インストール方法を選択してください:"
+    echo "1) 自動 (推奨) - configに基づく一括インストール"
+    echo "2) 手動 - 対話形式でモデル選択 (従来方式)"
+    echo "0) 終了"
+    echo ""
+    read -p "選択 (0-2): " mode
+
+    if [ "$mode" = "1" ]; then
+        run_python_installer && exit $?
+        echo "⚠️ Pythonインストーラーに失敗したため、手動モードに切り替えます。"
+    elif [ "$mode" = "0" ]; then
+        echo "終了します"; exit 0
+    fi
+
     echo ""
     echo "インストールレベルを選択してください:"
     echo "1) 最小構成 (VRAM 6GB) - 必須モデルのみ"
@@ -53,7 +80,7 @@ main() {
     echo "0) 終了"
     echo ""
     read -p "選択 (0-4): " choice
-    
+
     case $choice in
         1)
             echo ""
@@ -115,7 +142,7 @@ main() {
     echo ""
     echo "次のステップ:"
     echo "  python check_models.py  # モデル確認"
-    echo "  streamlit run app/pages/03_Advanced_Dialogue.py  # アプリ起動"
+    echo "  streamlit run app/pages/03_Advanced_Dialogue_Refactored.py  # アプリ起動"
     echo "=========================================="
 }
 

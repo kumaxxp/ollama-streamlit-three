@@ -34,7 +34,7 @@ echo "   URL: http://localhost:8501"
 echo ""
 
 # ログを抑制しながら起動
-streamlit run app/pages/03_Advanced_Dialogue.py \
+streamlit run app/pages/03_Advanced_Dialogue_Refactored.py \
     --server.port 8501 \
     --server.headless true \
     --browser.gatherUsageStats false \
