@@ -413,14 +413,17 @@ class DialogueController:
     
     def _get_current_speaker(self) -> str:
         """現在の話者を取得"""
-        # 交互に話す
+        # run_turn 冒頭で turn_count を +1 済みのため、初回は index 0 になるよう -1 で補正
         agent_names = list(self.agents.keys())
-        return agent_names[self.state.turn_count % 2]
+        idx = (self.state.turn_count - 1) % 2
+        return agent_names[idx]
     
     def _get_next_speaker(self) -> str:
         """次の話者を取得"""
+        # 現在 = (turn_count-1)%2 → 次 = turn_count%2
         agent_names = list(self.agents.keys())
-        return agent_names[(self.state.turn_count + 1) % 2]
+        idx = (self.state.turn_count) % 2
+        return agent_names[idx]
     
     def _build_agent_context(self, speaker_name: str) -> Dict:
         """エージェント用のコンテキストを構築"""

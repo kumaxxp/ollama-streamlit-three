@@ -166,7 +166,7 @@ class Agent:
                 background=self.character.get('background', ''),
                 values=self.character.get('values', '')
             )
-            return system_prompt
+            return self._append_required_constraints(system_prompt)
         # テンプレートがない場合は標準形式
         system_prompt = (
             f"あなたは{self.character['name']}です。\n"
@@ -183,7 +183,7 @@ class Agent:
             f"- 自然な対話を心がけてください\n"
             f"- 議論を建設的に進めてください\n"
         )
-        return system_prompt
+        return self._append_required_constraints(system_prompt)
 
     # （不要な日本語生文字列を削除済み）
     
@@ -233,13 +233,14 @@ class Agent:
         if self.turn_directives:
             latest_directive = self.turn_directives[-1]
             prompt_parts.append(f"\n【今回の注意点】")
-            prompt_parts.append(latest_directive['instruction'])
-            if latest_directive['attention_points']:
-                prompt_parts.append("- " + "\n- ".join(latest_directive['attention_points']))
+            prompt_parts.append(latest_directive.get('instruction', ''))
+            points = latest_directive.get('attention_points') or []
+            if isinstance(points, list) and points:
+                prompt_parts.append("- " + "\n- ".join(points))
             
             # 長さ指示が含まれているかチェック
             length_guidance = None
-            for point in latest_directive['attention_points']:
+            for point in points:
                 if "簡潔" in point:
                     length_guidance = "50-100文字程度で簡潔に"
                 elif "詳細" in point:
@@ -249,18 +250,26 @@ class Agent:
             
             if length_guidance:
                 prompt_parts.append(f"\n【応答の長さ】{length_guidance}")
-        
-        # 応答指示
-        prompt_parts.append(f"\n上記を踏まえて、{opponent_name}に対して{self.character['name']}として応答してください。")
-        prompt_parts.append("自然で、あなたらしい発言を心がけてください。")
-        
-        # フォーマット指示を追加
+
+        # 応答/開始指示（初回は開始、以降は応答）
+        is_opening = (not recent_history) and (not opponent_message)
+        if is_opening:
+            prompt_parts.append(f"\n上記を踏まえて、{self.character['name']}として会話を開始してください。")
+            prompt_parts.append("テーマに即した導入を述べ、必要なら短い問いかけで締めてください。挨拶は不要です。")
+        else:
+            prompt_parts.append(f"\n上記を踏まえて、{opponent_name}に対して{self.character['name']}として応答してください。")
+            prompt_parts.append("自然で、あなたらしい発言を心がけてください。")
+
+        # フォーマット指示を追加（UI表示用、生成時は構造化メッセージを使用）
         prompt_parts.append("\n【応答形式の注意】")
         prompt_parts.append("- 挨拶（こんにちは等）は不要です。すぐに本題に入ってください")
         prompt_parts.append("- 箇条書きや見出しは使わず、自然な会話文で応答してください")
         prompt_parts.append("- マークダウン記号（##、**、-、・など）は使わないでください")
         prompt_parts.append("- 普通に会話するような、流れるような文章で話してください")
-        
+        prompt_parts.append("- 他キャラクタの発言や台本形式の会話文は書かないでください")
+        prompt_parts.append("- 出力はあなた自身の発言1〜2文のみ。相手のセリフや名前は書かない")
+        prompt_parts.append("- キャラクタ名や役割（A/B等）を出力に含めない")
+
         return "\n".join(prompt_parts)
     
     async def generate_response(self, context: Dict, system_prompt: Optional[str] = None, user_prompt: Optional[str] = None) -> str:
@@ -273,22 +282,25 @@ class Agent:
         Returns:
             生成された応答
         """
-        # allow caller to provide pre-built prompts (to avoid duplicate building and to expose them to UI)
-        if user_prompt is None:
-            prompt = self.build_prompt(context)
-        else:
-            prompt = user_prompt
-
+        # system prompt（必須制約を付与）
         if system_prompt is None:
             system_prompt = self._build_system_prompt()
+        else:
+            system_prompt = self._append_required_constraints(system_prompt)
+
+        # 構造化メッセージに変換（台本風混入防止）
+        messages = self._build_structured_messages(context, system_prompt)
+        # 直近の指示（ディレクター変換済みテキスト）を追加（別system）
+        if self.turn_directives:
+            latest = self.turn_directives[-1]
+            directive_text = latest.get("instruction", "")
+            if directive_text:
+                messages.insert(1, {"role": "system", "content": directive_text})
         
         try:
             response = self.client.chat(
                 model=self.model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt}
-                ],
+                messages=messages,
                 options={
                     "temperature": self.temperature,
                     "top_p": 0.95,
@@ -296,8 +308,43 @@ class Agent:
                 },
                 stream=False
             )
-            
             generated_text = response['message']['content']
+
+            # Post-check（キャラ混入検査）
+            own_name = self.character['name']
+            other_names = []
+            try:
+                # opponent 名（コンテキストから）
+                if context.get('opponent_name'):
+                    other_names.append(context['opponent_name'])
+            except Exception:
+                pass
+
+            if self._check_character_leak(generated_text, own_name, other_names):
+                # 1回だけ再生成（違反を明記）
+                retry_messages = messages + [{
+                    "role": "system",
+                    "content": "直前の出力に相手の発言や名前が含まれていました。自分の発言のみ（1〜2文）で、相手のセリフや名前を書かずに再出力してください。"
+                }]
+                try:
+                    response = self.client.chat(
+                        model=self.model_name,
+                        messages=retry_messages,
+                        options={
+                            "temperature": self.temperature,
+                            "top_p": 0.95,
+                            "seed": None
+                        },
+                        stream=False
+                    )
+                    retried = response['message']['content']
+                    if self._check_character_leak(retried, own_name, other_names):
+                        # 強制カット
+                        generated_text = self._force_cut_single_speaker(retried, own_name, other_names)
+                    else:
+                        generated_text = retried
+                except Exception:
+                    generated_text = self._force_cut_single_speaker(generated_text, own_name, other_names)
             
             # メモリに追加
             self.memory.append({
@@ -316,6 +363,120 @@ class Agent:
                 "message": self._get_fallback_response(context),
                 "detail": str(e)
             }
+
+    # ====== キャラ混在対策ユーティリティ ======
+    def _append_required_constraints(self, system_prompt: str) -> str:
+        """system prompt末尾に必須制約文言を付与"""
+        name = self.character.get('name', 'あなた')
+        req = (
+            f"\n【厳守事項】\n"
+            f"- あなたは『{name}』です。\n"
+            f"- 他キャラクタの発言や台本形式の会話文は書かないでください。\n"
+            f"- 出力はあなた自身の発言1〜2文のみ。相手のセリフや名前は書かない。\n"
+            f"- キャラクタ名や役割（{name}やA/B等）を出力に含めない。\n"
+        )
+        if req.strip() in system_prompt:
+            return system_prompt
+        return f"{system_prompt}\n{req}"
+
+    def _build_structured_messages(self, context: Dict, system_prompt: str) -> List[Dict[str, str]]:
+        """仕様 2.3 に沿ったメッセージ配列を構築"""
+        own_name = self.character.get('name', '自分')
+        opponent_name = context.get('opponent_name', '相手')
+        opponent_msg = context.get('opponent_message', '') or ''
+        recent = context.get('recent_history', []) or []
+
+        # 直近の自分の発話を取得
+        own_last: Optional[str] = None
+        for item in reversed(recent):
+            if item.get('speaker') == own_name:
+                own_last = str(item.get('message', ''))
+                break
+
+        messages: List[Dict[str, str]] = []
+        messages.append({"role": "system", "content": system_prompt})
+
+        # セッションコンテキスト（テーマ/目的/フェーズ）を簡潔に明示
+        theme = (self.session_context or {}).get('theme') or context.get('theme')
+        goal = (self.session_context or {}).get('goal') or context.get('goal')
+        phase = (self.session_context or {}).get('phase') or context.get('phase')
+        ctx_lines: List[str] = []
+        if theme:
+            ctx_lines.append(f"- テーマ: {theme}")
+        if goal:
+            ctx_lines.append(f"- 目的: {goal}")
+        if phase:
+            ctx_lines.append(f"- 現在フェーズ: {phase}")
+        if ctx_lines:
+            messages.append({
+                "role": "system",
+                "content": "【セッションコンテキスト】\n" + "\n".join(ctx_lines)
+            })
+
+        # 開始/通常の分岐
+        is_opening = (len(recent) == 0 and not opponent_msg)
+
+        if is_opening:
+            # 開始専用の追加system（短く本題へ・名前や台本禁止を再強調）
+            start_lines = [
+                "【開始指示】",
+                "これは会話の最初の発話です。",
+                "- 挨拶は不要です。すぐに本題に入ってください。",
+                "- テーマに即した導入を述べ、必要なら短い問いかけで締めてください。",
+                "- 相手のセリフや名前、台本形式（A: / B: など）は書かないでください。",
+            ]
+            messages.append({"role": "system", "content": "\n".join(start_lines)})
+            # userには中立のトリガーだけを与える（相手名は入れない）
+            trigger = "開始: テーマに基づく導入を述べてください。"
+            messages.append({"role": "user", "content": trigger})
+        else:
+            # 直近の自分の発話（あれば assistant）
+            if own_last:
+                messages.append({"role": "assistant", "content": f"{own_name}: {own_last}"})
+            # 相手の最新発話（user）
+            if opponent_msg:
+                messages.append({"role": "user", "content": f"{opponent_name}: {opponent_msg}"})
+            else:
+                # 最低限の起点（従来どおり。ただし冒頭ではis_opening側が使われる）
+                messages.append({"role": "user", "content": f"{opponent_name}: （前の続き）"})
+
+        return messages
+
+    def _check_character_leak(self, output_text: str, own_name: str, other_names: List[str]) -> bool:
+        import re
+        text = output_text.strip()
+        # 他キャラ名が含まれる
+        for n in other_names:
+            if n and n in text:
+                return True
+        # ラベル混入（先頭/空白後）
+        if re.search(r"(^|\s)[AB][：:]", text):
+            return True
+        name_alt = [re.escape(own_name)] + [re.escape(n) for n in other_names if n]
+        if name_alt:
+            pattern = rf"(^|\s)({'|'.join(name_alt)})[：:]"
+            if re.search(pattern, text):
+                return True
+        return False
+
+    def _force_cut_single_speaker(self, text: str, own_name: str, other_names: List[str]) -> str:
+        """緊急カット: 他名やラベルを除去し、自分の発話だけに整形"""
+        import re
+        s = text
+        # 行頭や空白後の「名前:」を除去（自分/他人どちらも）
+        names = [own_name] + [n for n in other_names if n]
+        if names:
+            pattern = rf"(^|\s)({'|'.join([re.escape(n) for n in names])})[：:]\s*"
+            s = re.sub(pattern, " ", s).strip()
+        # 相手名を含む単純な書き起こしの除去
+        for n in other_names:
+            if not n:
+                continue
+            s = s.replace(f"{n}：", "").replace(f"{n}:", "")
+        # 2文に制限
+        parts = re.split(r"[。.!?？！]+", s)
+        parts = [p for p in parts if p.strip()]
+        return ("。".join(parts[:2]) + ("。" if parts[:2] else "")).strip()
     
     def _get_fallback_response(self, context: Dict) -> str:
         """エラー時のフォールバック応答"""

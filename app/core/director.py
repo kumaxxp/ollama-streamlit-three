@@ -70,6 +70,14 @@ class NaturalConversationDirector:
         max_chars = self._decide_max_chars(stats)
         aizuchi = self._decide_aizuchi(stats)
         closing_hint = self._decide_closing(stats)
+        # 禁止項目（会話汚染防止）
+        ban_list = [
+            "praise",
+            "long_intro",
+            "list_format",
+            "other_character_name",
+            "speaker_label_prefix",
+        ]
 
         cmd = {
             "turn_style": {
@@ -82,7 +90,7 @@ class NaturalConversationDirector:
                 },
                 "speech_act": speech_act,  # ask|answer|reflect|agree_short|disagree_short|handoff
                 "follow_up": "ask_feel" if speech_act == "ask" else "none",
-                "ban": ["praise", "long_intro", "list_format"],
+                "ban": ban_list,
             },
             "cadence": {
                 "avoid_consecutive_monologues": True,
