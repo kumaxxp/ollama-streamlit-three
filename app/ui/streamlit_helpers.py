@@ -92,9 +92,17 @@ ollama pull gemma3:4b
         return final_list
 
     except Exception as e:
-        st.warning(f"⚠️ モデル取得エラー: {e}")
-        # エラー時のフォールバック
-        return ["qwen:7b", "gemma2:2b", "llama3.2:3b"]
+        # より詳細にハンドリングしてUIに表示
+        err_msg = str(e)
+        if isinstance(e, (OSError, IOError)):
+            st.error(f"⚠️ モデル取得時のI/Oエラー: {err_msg}")
+            st.info("ローカルの ollama サーバやファイルアクセスに問題がある可能性があります。`ollama serve` が起動しているか、権限/ソケットを確認してください。")
+        else:
+            st.warning(f"⚠️ モデル取得エラー: {err_msg}")
+
+        # エラー時のフォールバック（明示的に少数を返す）
+        fallback = ["qwen:7b", "gemma2:2b", "llama3.2:3b"]
+        return fallback
 
 def check_and_suggest_model(model_name: str) -> Optional[str]:
     """

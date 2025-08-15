@@ -310,7 +310,12 @@ class Agent:
             
         except Exception as e:
             logger.error(f"Response generation error for {self.agent_id}: {e}")
-            return self._get_fallback_response(context)
+            # Return structured error info so controller/UI can surface it
+            return {
+                "error": True,
+                "message": self._get_fallback_response(context),
+                "detail": str(e)
+            }
     
     def _get_fallback_response(self, context: Dict) -> str:
         """エラー時のフォールバック応答"""

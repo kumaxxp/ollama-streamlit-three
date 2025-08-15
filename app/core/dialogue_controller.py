@@ -209,7 +209,11 @@ class DialogueController:
             print(f"Response generation error: {e}")
             response = "申し訳ございません、応答の生成に失敗しました。"
         
-        yield {"type": "agent_response", "data": {"agent": current_speaker, "response": response}}
+        # If the agent returned a structured error, preserve it in the event
+        if isinstance(response, dict) and response.get('error'):
+            yield {"type": "agent_response", "data": {"agent": current_speaker, "response": response.get('message'), "error": True, "detail": response.get('detail')}}
+        else:
+            yield {"type": "agent_response", "data": {"agent": current_speaker, "response": response}}
         
         # 履歴を更新
         self._update_history(current_speaker, response)

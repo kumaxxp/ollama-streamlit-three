@@ -269,16 +269,25 @@ with dialogue_container:
             # システムメッセージ
             st.info(entry["content"])
         
-        elif entry["type"] == "agent":
+        elif entry["type"] == "agent" or entry["type"] == "agent_error":
             # エージェントの発言
             char_name = entry.get("name", "Unknown")
             icon = entry.get("icon", "👤")
             message = entry.get("content", "")
             turn = entry.get("turn", 0)
-
-            with st.chat_message("assistant", avatar=icon):
-                st.markdown(f"**{char_name}** (Turn {turn})")
-                st.write(message)
+            
+            # エラーメッセージは強調表示
+            if entry["type"] == "agent_error":
+                with st.container():
+                    st.error(f"⚠️ {char_name} (Turn {turn}) - 応答にエラーが発生しました")
+                    st.write(message)
+                    if entry.get('detail'):
+                        with st.expander("詳細エラー情報", expanded=False):
+                            st.code(entry.get('detail'))
+            else:
+                with st.chat_message("assistant", avatar=icon):
+                    st.markdown(f"**{char_name}** (Turn {turn})")
+                    st.write(message)
 
         elif entry["type"] == "agent_prompt":
             # システム/ユーザープロンプトを表示（レスポンス前に入る）
@@ -339,7 +348,9 @@ if st.session_state.is_running and st.session_state.controller and st.session_st
                 if event["type"] == "agent_response":
                     agent_name = event["data"]["agent"]
                     response = event["data"]["response"]
-                    
+                    is_error = event["data"].get('error', False)
+                    detail = event["data"].get('detail') if is_error else None
+
                     # キャラクター名とアイコンを取得
                     if agent_name in st.session_state.controller.agents:
                         char_name = st.session_state.controller.agents[agent_name].character.get('name', agent_name)
@@ -347,15 +358,17 @@ if st.session_state.is_running and st.session_state.controller and st.session_st
                     else:
                         char_name = agent_name
                         icon = "👤"
-                    
+
                     # 履歴に追加
+                    entry_type = "agent_error" if is_error else "agent"
                     st.session_state.dialogue_history.append({
-                        "type": "agent",
+                        "type": entry_type,
                         "name": char_name,
                         "icon": icon,
                         "content": response,
                         "turn": st.session_state.turn_count + 1,
-                        "timestamp": datetime.now().isoformat()
+                        "timestamp": datetime.now().isoformat(),
+                        "detail": detail
                     })
                 
                 elif event["type"] == "director_intervention":
