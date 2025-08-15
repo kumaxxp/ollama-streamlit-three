@@ -1,11 +1,12 @@
-# Python
+###############################################
+# Python caches and build artifacts
+###############################################
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
 build/
-develop-eggs/
 dist/
 downloads/
 eggs/
@@ -21,42 +22,63 @@ wheels/
 *.egg
 MANIFEST
 
-# Virtual Environment
+###############################################
+# Virtual environments and local env files
+###############################################
+.venv/
 venv/
-ENV/
 env/
-.venv
+ENV/
+.env
+.env.*
 
-# IDE
+###############################################
+# Test and tooling caches
+###############################################
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+###############################################
+# IDE/editor
+###############################################
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# OS
+###############################################
+# OS files
+###############################################
 .DS_Store
 Thumbs.db
 
-# Data files
-data/dialogues/*.json
-data/dialogues/*.txt
-
+###############################################
+# Project runtime artifacts
+###############################################
 # Logs
 *.log
 logs/
+# Dialogue run artifacts (keep directory, ignore JSON data files)
+data/dialogues/*.json
+data/dialogues/*.txt
 
-# Streamlit
-.streamlit/secrets.toml
+###############################################
+# Streamlit local state
+###############################################
+.streamlit/
 
-# Temporary files
+###############################################
+# Temporary/backup files
+###############################################
 *.tmp
 temp/
 tmp/
-
-# Backup files
 *.bak
 *.backup
 
+###############################################
 # Local config overrides (if any)
+###############################################
 config/local_*.json

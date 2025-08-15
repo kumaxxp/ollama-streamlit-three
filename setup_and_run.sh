@@ -119,7 +119,7 @@ show_menu() {
     echo ""
     echo "起動するページを選択してください:"
     echo "1) 01_Simple_Chat - シンプルチャット"
-    echo "2) 03_Advanced_Dialogue - Advanced対話システム（推奨）"
+    echo "2) 03_Advanced_Dialogue_Refactored - Advanced対話システム（推奨）"
     echo "3) すべてのページ（サイドバーで切り替え可能）"
     echo "q) 終了"
     echo ""

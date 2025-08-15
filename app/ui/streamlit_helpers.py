@@ -1,6 +1,6 @@
 """
 Streamlit Helper Functions
-既存の03_Advanced_Dialogue.pyから抽出した共通処理（モデル名修正版）
+元 03_Advanced_Dialogue.py（現: 03_Advanced_Dialogue_Refactored.py）から抽出した共通処理（モデル名修正版）
 """
 import streamlit as st
 import ollama

@@ -25,7 +25,7 @@
 ### 2.1 システム構成図
 ```
 ┌─────────────────────────────────────┐
-│         03_Advanced_Dialogue.py      │
+│   03_Advanced_Dialogue_Refactored.py │
 │              (UI Layer)              │
 └─────────────────────────────────────┘
                     ↓
@@ -72,7 +72,7 @@
 ollama-streamlit-three/
 ├── app/
 │   ├── pages/
-│   │   └── 03_Advanced_Dialogue.py   # UI層（改良版）
+│   │   └── 03_Advanced_Dialogue_Refactored.py   # UI層（改良版）
 │   └── core/
 │       ├── agent.py                  # 一般人エージェント
 │       ├── director.py               # 自発的Director
