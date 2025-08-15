@@ -135,7 +135,8 @@ with st.sidebar:
             st.info("✓ Qwenモデル（日本語対応）")
     
     if director_model:
-        if "gemma3:4b" in director_model or "gemma2:2b" in director_model:
+        dm = str(director_model)
+        if "gemma3:4b" in dm or "gemma2:2b" in dm:
             st.success("✅ Director推奨（高速判断）")
     
     st.divider()
@@ -274,10 +275,18 @@ with dialogue_container:
             icon = entry.get("icon", "👤")
             message = entry.get("content", "")
             turn = entry.get("turn", 0)
-            
+
             with st.chat_message("assistant", avatar=icon):
                 st.markdown(f"**{char_name}** (Turn {turn})")
                 st.write(message)
+
+        elif entry["type"] == "agent_prompt":
+            # システム/ユーザープロンプトを表示（レスポンス前に入る）
+            st.markdown(f"**{entry['icon']} {entry['name']} のプロンプト（Turn {entry['turn']})**")
+            with st.expander("System Prompt", expanded=False):
+                st.code(entry.get("system_prompt", ""))
+            with st.expander("User Prompt", expanded=False):
+                st.code(entry.get("user_prompt", ""))
         
         elif entry["type"] == "director":
             # Director介入
@@ -299,8 +308,34 @@ if st.session_state.is_running and st.session_state.controller and st.session_st
             # ターン実行
             for event in st.session_state.controller.run_turn():
                 events.append(event)
-                
+
                 # イベント処理
+                if event["type"] == "agent_prompts":
+                    agent_name = event["data"]["agent"]
+                    system_prompt = event["data"].get("system_prompt")
+                    user_prompt = event["data"].get("user_prompt")
+
+                    # 表示用にキャラクター名を取得
+                    if agent_name in st.session_state.controller.agents:
+                        char_name = st.session_state.controller.agents[agent_name].character.get('name', agent_name)
+                        icon = get_character_icon(char_name)
+                    else:
+                        char_name = agent_name
+                        icon = "👤"
+
+                    # 履歴にプロンプト情報を追加（表示はレスポンスの直前に行う）
+                    st.session_state.dialogue_history.append({
+                        "type": "agent_prompt",
+                        "name": char_name,
+                        "icon": icon,
+                        "system_prompt": system_prompt,
+                        "user_prompt": user_prompt,
+                        "turn": st.session_state.turn_count + 1,
+                        "timestamp": datetime.now().isoformat()
+                    })
+
+                    continue
+
                 if event["type"] == "agent_response":
                     agent_name = event["data"]["agent"]
                     response = event["data"]["response"]

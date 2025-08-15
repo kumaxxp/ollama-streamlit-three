@@ -4,6 +4,7 @@ Streamlit Helper Functions
 """
 import streamlit as st
 import ollama
+_HAS_OLLAMA = True
 from typing import List, Dict, Optional
 
 @st.cache_data(ttl=300)
@@ -15,16 +16,19 @@ def get_available_models() -> List[str]:
     Returns:
         利用可能なモデル名のリスト
     """
+    if not _HAS_OLLAMA:
+        st.warning("⚠️ `ollama` ライブラリが見つかりません。ローカル実行時はollamaをインストールしてください。フォールバックのモデルリストを使用します。")
+        return ["qwen:7b", "gemma2:2b", "llama3.2:3b"]
+
     try:
         client = ollama.Client()
         models_list = client.list()
-        
+
         model_names = []
         for model in models_list.get('models', []):
             model_name = model.get('name', '')
             if model_name:
                 model_names.append(model_name)
-        
         # デバッグ: 実際のモデル名を確認
         print(f"Available models: {model_names}")
         
@@ -86,7 +90,7 @@ ollama pull gemma3:4b
             return ["qwen:7b", "gemma2:2b"]
         
         return final_list
-        
+
     except Exception as e:
         st.warning(f"⚠️ モデル取得エラー: {e}")
         # エラー時のフォールバック
@@ -163,21 +167,32 @@ def render_model_selector(
 
 def get_character_options() -> Dict[str, str]:
     """
-    利用可能なキャラクター一覧を取得
-    
+    利用可能なキャラクター一覧をconfig/characters.jsonから取得
     Returns:
         キャラクターID -> 表示名の辞書
     """
-    return {
-        "AI-tuber-college_student_girl": "やな（AI姉）",
-        "AI-tuber-high_school_girl": "あゆ（AI妹）",
-        "high_school_girl_optimistic": "さくら（高校生）",
-        "office_worker_tired": "田中（会社員）",
-        "college_student_curious": "ユウキ（大学生）",
-        "housewife_practical": "美咲（主婦）",
-        "freelancer_creative": "レン（フリーランス）",
-        "retired_wise": "山田（元教師）"
-    }
+    import os
+    import json
+    char_path_candidates = [
+        'config/characters.json',
+        './config/characters.json',
+        '../config/characters.json',
+        '../../config/characters.json',
+        os.path.join(os.path.dirname(__file__), '../../config/characters.json')
+    ]
+    characters_data = None
+    for path in char_path_candidates:
+        if os.path.exists(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    characters_data = json.load(f)
+                break
+            except Exception:
+                continue
+    if not characters_data or 'characters' not in characters_data:
+        # フォールバック
+        return {}
+    return {k: v.get('name', k) for k, v in characters_data['characters'].items()}
 
 def get_theme_options() -> List[str]:
     """
@@ -285,6 +300,11 @@ def check_ollama_connection() -> bool:
     Returns:
         接続可能ならTrue
     """
+    if not _HAS_OLLAMA:
+        # ollama ライブラリがそもそも無い場合は接続確認はスキップするが
+        # ユーザーに警告を出してアプリを継続できるようにする。
+        st.warning("⚠️ `ollama` ライブラリが見つかりません。ローカルに ollama をインストールしていない場合、実際のモデル呼び出しはできません。")
+        return True
     try:
         client = ollama.Client()
         client.list()

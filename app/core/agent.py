@@ -5,6 +5,7 @@ Agent - 対話エージェントの実装
 
 import json
 import logging
+import os
 from typing import Dict, List, Optional
 from datetime import datetime
 
@@ -77,7 +78,42 @@ class Agent:
         if 'characters' in characters_data:
             if character_type in characters_data['characters']:
                 logger.info(f"Character '{character_type}' loaded successfully")
-                return characters_data['characters'][character_type]
+                character = characters_data['characters'][character_type]
+
+                # 外部ファイル参照があれば読み込んで prompt_template にセットする
+                if 'prompt_template_file' in character:
+                    # 可能な相対パス候補: characters.json のディレクトリ基準、およびワークディレクトリ基準
+                    base_dirs = []
+                    if used_path:
+                        base_dirs.append(os.path.dirname(os.path.abspath(used_path)))
+                    base_dirs.extend([os.getcwd(), os.path.abspath('.')])
+
+                    file_path = character.get('prompt_template_file')
+                    found = False
+                    for base in base_dirs:
+                        candidate = os.path.join(base, file_path)
+                        if os.path.exists(candidate):
+                            try:
+                                with open(candidate, 'r', encoding='utf-8') as pf:
+                                    character['prompt_template'] = pf.read()
+                                logger.info(f"Loaded prompt template from file: {candidate}")
+                                found = True
+                                break
+                            except Exception as e:
+                                logger.error(f"Failed to read prompt template file {candidate}: {e}")
+                                continue
+                    if not found:
+                        # そのままファイルパスを試す
+                        try:
+                            if os.path.exists(file_path):
+                                with open(file_path, 'r', encoding='utf-8') as pf:
+                                    character['prompt_template'] = pf.read()
+                                logger.info(f"Loaded prompt template from file: {file_path}")
+                                found = True
+                        except Exception as e:
+                            logger.error(f"Failed to read prompt template file {file_path}: {e}")
+
+                return character
             else:
                 logger.warning(f"Character type '{character_type}' not found in characters.json")
                 logger.warning(f"Available characters: {list(characters_data['characters'].keys())}")
@@ -119,35 +155,37 @@ class Agent:
         })
     
     def _build_system_prompt(self) -> str:
-        """システムプロンプトを構築"""
+        """システムプロンプトを構築（UIで表示するためprintは行わない）"""
         # キャラクターのプロンプトテンプレートを使用
         if 'prompt_template' in self.character:
-            # テンプレートに値を埋め込み
             template = self.character['prompt_template']
-            return template.format(
+            system_prompt = template.format(
                 name=self.character['name'],
                 personality=self.character.get('personality', ''),
                 speaking_style=self.character.get('speaking_style', ''),
                 background=self.character.get('background', ''),
                 values=self.character.get('values', '')
             )
-        
+            return system_prompt
         # テンプレートがない場合は標準形式
-        return f"""
-あなたは{self.character['name']}です。
+        system_prompt = (
+            f"あなたは{self.character['name']}です。\n"
+            f"\n"
+            f"【基本設定】\n"
+            f"性格: {self.character.get('personality', '未設定')}\n"
+            f"話し方: {self.character.get('speaking_style', '自然な日本語')}\n"
+            f"背景: {self.character.get('background', '一般的な背景')}\n"
+            f"価値観: {self.character.get('values', '建設的な対話')}\n"
+            f"\n"
+            f"【重要な指示】\n"
+            f"- あなたのキャラクターを一貫して保ってください\n"
+            f"- 相手の発言をよく聞き、それに応答してください\n"
+            f"- 自然な対話を心がけてください\n"
+            f"- 議論を建設的に進めてください\n"
+        )
+        return system_prompt
 
-【基本設定】
-性格: {self.character.get('personality', '未設定')}
-話し方: {self.character.get('speaking_style', '自然な日本語')}
-背景: {self.character.get('background', '一般的な背景')}
-価値観: {self.character.get('values', '建設的な対話')}
-
-【重要な指示】
-- あなたのキャラクターを一貫して保ってください
-- 相手の発言をよく聞き、それに応答してください
-- 自然な対話を心がけてください
-- 議論を建設的に進めてください
-"""
+    # （不要な日本語生文字列を削除済み）
     
     def build_prompt(self, context: Dict) -> str:
         """
@@ -225,7 +263,7 @@ class Agent:
         
         return "\n".join(prompt_parts)
     
-    async def generate_response(self, context: Dict) -> str:
+    async def generate_response(self, context: Dict, system_prompt: Optional[str] = None, user_prompt: Optional[str] = None) -> str:
         """
         応答を生成
         
@@ -235,8 +273,14 @@ class Agent:
         Returns:
             生成された応答
         """
-        prompt = self.build_prompt(context)
-        system_prompt = self._build_system_prompt()
+        # allow caller to provide pre-built prompts (to avoid duplicate building and to expose them to UI)
+        if user_prompt is None:
+            prompt = self.build_prompt(context)
+        else:
+            prompt = user_prompt
+
+        if system_prompt is None:
+            system_prompt = self._build_system_prompt()
         
         try:
             response = self.client.chat(

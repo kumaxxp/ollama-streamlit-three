@@ -172,11 +172,22 @@ class DialogueController:
                 # エージェントへの指示を更新
                 self._update_agent_instructions(intervention)
         
-        # エージェントの応答を生成
+    # エージェントの応答を生成
         yield {"type": "agent_start", "data": {"agent": current_speaker}}
         
         # 同期的に応答を生成（簡略化のため）
         context = self._build_agent_context(current_speaker)
+
+        # 事前にsystem/userプロンプトを生成してUIに渡す
+        try:
+            agent_obj = current_agent
+            system_prompt = agent_obj._build_system_prompt()
+            user_prompt = agent_obj.build_prompt(context)
+            yield {"type": "agent_prompts", "data": {"agent": current_speaker, "system_prompt": system_prompt, "user_prompt": user_prompt}}
+        except Exception:
+            # 生成失敗しても続行
+            system_prompt = None
+            user_prompt = None
         
         try:
             # asyncioを使わずに同期的に処理
@@ -187,12 +198,12 @@ class DialogueController:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 response = loop.run_until_complete(
-                    current_agent.generate_response(context)
+                    current_agent.generate_response(context, system_prompt=system_prompt, user_prompt=user_prompt)
                 )
                 loop.close()
             else:
                 # 同期関数の場合
-                response = current_agent.generate_response(context)
+                response = current_agent.generate_response(context, system_prompt=system_prompt, user_prompt=user_prompt)
                 
         except Exception as e:
             print(f"Response generation error: {e}")
