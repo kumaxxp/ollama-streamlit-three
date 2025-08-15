@@ -110,24 +110,26 @@ class DialogueController:
         
         # テーマを設定
         self.dialogue_manager.theme = self.config.theme
-        
+
         # エージェントを初期化
         agent_model = self.config.model_params.get('model', 'qwen2.5:7b')
-        agent_temp = self.config.model_params.get('temperature', 0.7)
-        
+        # 個別温度（指定がなければ共通temperature/既定値にフォールバック）
+        agent1_temp = self.config.model_params.get('agent1_temperature', self.config.model_params.get('temperature', 0.7))
+        agent2_temp = self.config.model_params.get('agent2_temperature', self.config.model_params.get('temperature', 0.7))
+
         self.agents = {
             self.config.agent1_name: Agent(
                 agent_id="agent1",
                 character_type=self.config.agent1_name,
                 model_name=agent_model,
-                temperature=agent_temp,
+                temperature=agent1_temp,
                 ollama_client=self.ollama_client
             ),
             self.config.agent2_name: Agent(
                 agent_id="agent2",
                 character_type=self.config.agent2_name,
                 model_name=agent_model,
-                temperature=agent_temp,
+                temperature=agent2_temp,
                 ollama_client=self.ollama_client
             )
         }

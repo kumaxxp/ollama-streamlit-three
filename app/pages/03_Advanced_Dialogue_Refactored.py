@@ -147,13 +147,17 @@ with st.sidebar:
     with st.expander("詳細設定", expanded=False):
         max_turns = st.slider("最大ターン数", 5, 30, 20)
         
-        col1, col2 = st.columns(2)
-        with col1:
-            default_agent_temp = mm.get_recommended_temperature(agent_model, use_case="agent")
-            agent_temp = st.slider("Agent温度", 0.1, 1.0, float(default_agent_temp), 0.1)
-        with col2:
-            default_director_temp = mm.get_recommended_temperature(director_model, use_case="director")
-            director_temp = st.slider("Director温度", 0.1, 1.0, float(default_director_temp), 0.1)
+        # Agent温度（個別設定）
+        default_agent_temp = mm.get_recommended_temperature(agent_model, use_case="agent")
+        col_a1, col_a2 = st.columns(2)
+        with col_a1:
+            agent1_temp = st.slider("Agent1温度", 0.1, 1.0, float(default_agent_temp), 0.1)
+        with col_a2:
+            agent2_temp = st.slider("Agent2温度", 0.1, 1.0, float(default_agent_temp), 0.1)
+
+        # Director温度（個別）
+        default_director_temp = mm.get_recommended_temperature(director_model, use_case="director")
+        director_temp = st.slider("Director温度", 0.1, 1.0, float(default_director_temp), 0.1)
         
         check_interval = st.number_input(
             "Director介入間隔",
@@ -211,7 +215,11 @@ if start_button:
         },
         model_params={
             "model": agent_model,
-            "temperature": agent_temp
+            # 後方互換のためtemperatureも残す（未使用時のフォールバック）
+            "temperature": float(agent1_temp),
+            # 個別温度
+            "agent1_temperature": float(agent1_temp),
+            "agent2_temperature": float(agent2_temp)
         }
     )
     
