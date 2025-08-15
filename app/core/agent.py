@@ -255,7 +255,7 @@ class Agent:
         is_opening = (not recent_history) and (not opponent_message)
         if is_opening:
             prompt_parts.append(f"\n上記を踏まえて、{self.character['name']}として会話を開始してください。")
-            prompt_parts.append("テーマに即した導入を述べ、必要なら短い問いかけで締めてください。挨拶は不要です。")
+            prompt_parts.append("テーマに即した導入を述べてください。挨拶は不要です。")
         else:
             prompt_parts.append(f"\n上記を踏まえて、{opponent_name}に対して{self.character['name']}として応答してください。")
             prompt_parts.append("自然で、あなたらしい発言を心がけてください。")
@@ -269,6 +269,7 @@ class Agent:
         prompt_parts.append("- 他キャラクタの発言や台本形式の会話文は書かないでください")
         prompt_parts.append("- 出力はあなた自身の発言1〜2文のみ。相手のセリフや名前は書かない")
         prompt_parts.append("- キャラクタ名や役割（A/B等）を出力に含めない")
+        prompt_parts.append("- 出力の先頭に名前やラベル（やな:、あゆ:、A:、B:など）を付けない")
 
         return "\n".join(prompt_parts)
     
@@ -312,13 +313,19 @@ class Agent:
 
             # Post-check（キャラ混入検査）
             own_name = self.character['name']
-            other_names = []
+            other_names: List[str] = []
             try:
                 # opponent 名（コンテキストから）
                 if context.get('opponent_name'):
                     other_names.append(context['opponent_name'])
             except Exception:
                 pass
+
+            # 検知/修正のために短縮名エイリアスも対象に含める
+            expanded_others: List[str] = []
+            for n in other_names:
+                expanded_others.extend(self._expand_name_aliases(n))
+            other_names = list(dict.fromkeys([*other_names, *expanded_others]))
 
             if self._check_character_leak(generated_text, own_name, other_names):
                 # 1回だけ再生成（違反を明記）
@@ -374,6 +381,7 @@ class Agent:
             f"- 他キャラクタの発言や台本形式の会話文は書かないでください。\n"
             f"- 出力はあなた自身の発言1〜2文のみ。相手のセリフや名前は書かない。\n"
             f"- キャラクタ名や役割（{name}やA/B等）を出力に含めない。\n"
+            f"- 出力の先頭に『名前:』や『A:』『B:』などのラベルを付けない。\n"
         )
         if req.strip() in system_prompt:
             return system_prompt
@@ -422,8 +430,9 @@ class Agent:
                 "【開始指示】",
                 "これは会話の最初の発話です。",
                 "- 挨拶は不要です。すぐに本題に入ってください。",
-                "- テーマに即した導入を述べ、必要なら短い問いかけで締めてください。",
+                "- テーマに即した導入を述べてください。",
                 "- 相手のセリフや名前、台本形式（A: / B: など）は書かないでください。",
+                "- 出力の先頭に名前やラベル（やな:、あゆ:、A:、B:など）を付けないでください。",
             ]
             messages.append({"role": "system", "content": "\n".join(start_lines)})
             # userには中立のトリガーだけを与える（相手名は入れない）
@@ -432,30 +441,38 @@ class Agent:
         else:
             # 直近の自分の発話（あれば assistant）
             if own_last:
-                messages.append({"role": "assistant", "content": f"{own_name}: {own_last}"})
+                messages.append({"role": "assistant", "content": own_last})
             # 相手の最新発話（user）
             if opponent_msg:
-                messages.append({"role": "user", "content": f"{opponent_name}: {opponent_msg}"})
+                messages.append({"role": "user", "content": opponent_msg})
             else:
                 # 最低限の起点（従来どおり。ただし冒頭ではis_opening側が使われる）
-                messages.append({"role": "user", "content": f"{opponent_name}: （前の続き）"})
+                messages.append({"role": "user", "content": "（前の続き）"})
 
         return messages
 
     def _check_character_leak(self, output_text: str, own_name: str, other_names: List[str]) -> bool:
         import re
         text = output_text.strip()
-        # 他キャラ名が含まれる
+        # 他キャラ名（エイリアス含む）がラベル様式で混入
+        names_other = []
         for n in other_names:
-            if n and n in text:
-                return True
+            names_other += self._expand_name_aliases(n)
+        names_other = [x for x in dict.fromkeys(names_other) if x]
+
         # ラベル混入（先頭/空白後）
         if re.search(r"(^|\s)[AB][：:]", text):
             return True
-        name_alt = [re.escape(own_name)] + [re.escape(n) for n in other_names if n]
+        name_alt = []
+        name_alt += [re.escape(x) for x in self._expand_name_aliases(own_name)]
+        name_alt += [re.escape(n) for n in names_other]
         if name_alt:
             pattern = rf"(^|\s)({'|'.join(name_alt)})[：:]"
             if re.search(pattern, text):
+                return True
+        # 他キャラ名が文中に明確に現れるケース（短縮名含む）
+        for n in names_other:
+            if n and (n + ":") in text or (n + "：") in text:
                 return True
         return False
 
@@ -464,12 +481,15 @@ class Agent:
         import re
         s = text
         # 行頭や空白後の「名前:」を除去（自分/他人どちらも）
-        names = [own_name] + [n for n in other_names if n]
+        names = []
+        names += self._expand_name_aliases(own_name)
+        for n in other_names:
+            names += self._expand_name_aliases(n)
         if names:
             pattern = rf"(^|\s)({'|'.join([re.escape(n) for n in names])})[：:]\s*"
             s = re.sub(pattern, " ", s).strip()
         # 相手名を含む単純な書き起こしの除去
-        for n in other_names:
+        for n in names:
             if not n:
                 continue
             s = s.replace(f"{n}：", "").replace(f"{n}:", "")
@@ -477,6 +497,22 @@ class Agent:
         parts = re.split(r"[。.!?？！]+", s)
         parts = [p for p in parts if p.strip()]
         return ("。".join(parts[:2]) + ("。" if parts[:2] else "")).strip()
+
+    def _expand_name_aliases(self, name: Optional[str]) -> List[str]:
+        """表示名から括弧付き注釈などを除いた短縮名エイリアスを返す"""
+        if not name:
+            return []
+        try:
+            n = str(name)
+            base = n.split("（")[0].split("(")[0].strip()
+            # 記号や空白の正規化
+            alts = [n.strip()]
+            if base and base not in alts:
+                alts.append(base)
+            # 全角コロン・半角コロンを伴うラベルマッチに備えて末尾空白も除く
+            return [a for a in alts if a]
+        except Exception:
+            return [str(name)] if name else []
     
     def _get_fallback_response(self, context: Dict) -> str:
         """エラー時のフォールバック応答"""
