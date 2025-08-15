@@ -25,6 +25,7 @@ from app.ui.streamlit_helpers import (
     show_connection_error,
     get_character_icon
 )
+from app.core.model_utils import ModelManager
 
 # ページ設定
 st.set_page_config(
@@ -101,6 +102,7 @@ with st.sidebar:
     st.subheader("🤖 モデル設定")
     
     models = get_available_models()
+    mm = ModelManager()
     
     # デフォルトモデルの設定
     default_agent_model = "qwen2.5:7b-instruct-q4_K_M"
@@ -147,9 +149,11 @@ with st.sidebar:
         
         col1, col2 = st.columns(2)
         with col1:
-            agent_temp = st.slider("Agent温度", 0.1, 1.0, 0.7, 0.1)
+            default_agent_temp = mm.get_recommended_temperature(agent_model, use_case="agent")
+            agent_temp = st.slider("Agent温度", 0.1, 1.0, float(default_agent_temp), 0.1)
         with col2:
-            director_temp = st.slider("Director温度", 0.1, 1.0, 0.3, 0.1)
+            default_director_temp = mm.get_recommended_temperature(director_model, use_case="director")
+            director_temp = st.slider("Director温度", 0.1, 1.0, float(default_director_temp), 0.1)
         
         check_interval = st.number_input(
             "Director介入間隔",

@@ -110,54 +110,64 @@ class ModelManager:
     
     def _get_fallback_models(self) -> List[str]:
         """
-        フォールバック用のモデルリスト
+        フォールバック用のモデルリスト（configベース）
         """
-        return [
-            # Qwen系列
-            "qwen2.5:7b",
-            "qwen2.5:14b",
-            "qwen2.5:32b",
-            "qwen2.5:72b",
-            
-            # Gemma系列
-            "gemma2:2b",
-            "gemma2:9b", 
-            "gemma2:27b",
-            "gemma3:3b",
-            "gemma3:9b",
-            "gemma3:12b",
-            
-            # Llama系列
-            "llama3.2:1b",
-            "llama3.2:3b",
-            "llama3.1:8b",
-            "llama3.1:70b",
-            
-            # GPT-OSS
-            "gpt-oss:latest",
-            "gpt-oss:small",
-            "gpt-oss:medium",
-            "gpt-oss:large",
-            
-            # DeepSeek系列
-            "deepseek-r1:7b",
-            "deepseek-r1:14b",
-            "deepseek-r1:32b",
-            "deepseek-r1:70b",
-            
-            # その他
-            "mixtral:8x7b",
-            "phi3:mini",
-            "phi3:medium",
-            "solar:latest",
-            "yi:34b",
-            "command-r:latest",
-            "codellama:13b",
-            "mistral:7b",
-            "neural-chat:7b",
-            "starling-lm:7b",
-            "vicuna:13b"
-        ]
+        # configから候補を収集し、順序をできるだけ保って重複排除
+        candidates: List[str] = []
+
+        # defaultのfallbackがあれば最上位
+        try:
+            default_models = self.model_config.get("default_models", {})
+            fb = default_models.get("fallback")
+            if fb:
+                candidates.append(fb)
+            # agent/directorのデフォルトも候補に
+            for k in ("agent", "director"):
+                mv = default_models.get(k)
+                if mv:
+                    candidates.append(mv)
+        except Exception:
+            pass
+
+        # model_selection_rulesのpreferred_modelsを追加
+        try:
+            rules = self.model_config.get("model_selection_rules", {})
+            for key in ("dialogue_agent", "director"):
+                pref = rules.get(key, {}).get("preferred_models", [])
+                candidates.extend(pref)
+        except Exception:
+            pass
+
+        # production_modelsの一覧をpriority順（numberが小さいほど高優先）で追加
+        try:
+            prod = self.model_config.get("production_models", {})
+            all_items = []
+            for group in prod.values():
+                if isinstance(group, list):
+                    all_items.extend(group)
+            # priorityのないものは後ろ
+            all_items.sort(key=lambda x: (x.get("priority") is None, x.get("priority", 1_000_000)))
+            candidates.extend([item.get("name") for item in all_items if item.get("name")])
+        except Exception:
+            pass
+
+        # 重複排除（順序保持）
+        seen = set()
+        ordered: List[str] = []
+        for c in candidates:
+            if c and c not in seen:
+                seen.add(c)
+                ordered.append(c)
+
+        # 最低限のフォールバック
+        if not ordered:
+            ordered = ["qwen:7b", "gemma2:2b", "llama3.2:3b"]
+
+        return ordered
+
+    def get_fallback_models(self) -> List[str]:
+        """UI等から利用する公開用フォールバック候補取得"""
+        return self._get_fallback_models()
     
     def get_sorted_models(self, available_models: List[str]) -> List[str]:
         """
@@ -169,45 +179,42 @@ class ModelManager:
         Returns:
             ソート済みモデルリスト
         """
-        # 推奨モデルの優先順位
-        priority_order = [
-            # 日本語最適化
-            "qwen2.5:7b",
-            "qwen2.5:14b",
-            "qwen2.5:32b",
-            
-            # 一般用途
-            "gemma2:9b",
-            "gemma3:12b",
-            "gemma2:27b",
-            
-            # 軽量
-            "llama3.2:3b",
-            "llama3.1:8b",
-            
-            # 特殊用途
-            "gpt-oss:latest",
-            "deepseek-r1:7b",
-            "deepseek-r1:14b",
-            
-            # その他
-            "mixtral:8x7b",
-            "phi3:medium",
-            "command-r:latest"
-        ]
-        
+        # configから優先順リストを構築
+        priority_order: List[str] = []
+
+        # 1) production_modelsのpriority順
+        try:
+            prod = self.model_config.get("production_models", {})
+            all_items = []
+            for group in prod.values():
+                if isinstance(group, list):
+                    all_items.extend(group)
+            if all_items:
+                all_items.sort(key=lambda x: (x.get("priority") is None, x.get("priority", 1_000_000)))
+                priority_order = [item.get("name") for item in all_items if item.get("name")]
+        except Exception:
+            pass
+
+        # 2) 次にmodel_selection_rulesのpreferred_models
+        if not priority_order:
+            try:
+                rules = self.model_config.get("model_selection_rules", {})
+                priority_order = []
+                for key in ("dialogue_agent", "director"):
+                    priority_order.extend(rules.get(key, {}).get("preferred_models", []))
+            except Exception:
+                priority_order = []
+
+        # 3) まだ空ならフォールバック候補
+        if not priority_order:
+            priority_order = self._get_fallback_models()
+
         # 優先モデルと利用可能モデルの交差
-        priority_available = []
-        for model in priority_order:
-            if model in available_models:
-                priority_available.append(model)
-        
+        priority_available = [m for m in priority_order if m in available_models]
+
         # その他のモデル
-        other_models = sorted([
-            m for m in available_models 
-            if m not in priority_available
-        ])
-        
+        other_models = sorted([m for m in available_models if m not in set(priority_available)])
+
         return priority_available + other_models
     
     def get_model_info(self, model_name: str) -> Dict:
@@ -248,23 +255,61 @@ class ModelManager:
     
     def get_recommended_temperature(self, model_name: str, use_case: str = "dialogue") -> float:
         """
-        モデルと用途に応じた推奨温度を取得
-        
+        モデルと用途に応じた推奨温度を取得（configを単一ソースとして参照）
+        優先度: 1) production_models 個別設定 > 2) model_selection_rules 用途別 > 3) 既定値
+
         Args:
-            model_name: モデル名
-            use_case: 用途（dialogue, director等）
-            
+            model_name: モデル名（タグ含む）
+            use_case: 用途（"agent"|"dialogue"|"creative"|"director"）
+
         Returns:
-            推奨温度
+            推奨温度（0.0〜1.0想定）
         """
-        temp_config = self.model_config.get("temperature_recommendations", {})
-        
-        if use_case == "director":
-            return temp_config.get("director_judgment", {}).get("default", 0.3)
+        try:
+            # 正規化: 用途をagent/dialogue/creative/directorに丸める
+            uc = (use_case or "dialogue").lower()
+            if uc in ("agent", "dialogue"):
+                uc_key = "agent"
+            elif uc == "creative":
+                uc_key = "agent"  # creativeはagent系の一種として扱い、用途別既定でカバー
+            else:
+                uc_key = "director"
+
+            # 1) production_modelsから個別温度
+            prod = self.model_config.get("production_models", {})
+            for group in prod.values():
+                if isinstance(group, list):
+                    for item in group:
+                        if item.get("name") == model_name:
+                            temp = item.get("temperature", {})
+                            if uc_key == "director":
+                                val = temp.get("director")
+                            else:
+                                val = temp.get("agent")
+                            if isinstance(val, (int, float)):
+                                return float(val)
+
+            # 2) 用途別ルールの推奨
+            rules = self.model_config.get("model_selection_rules", {})
+            if uc_key == "director":
+                val = rules.get("director", {}).get("recommended_temperature")
+            else:
+                # agent/dialogue/creative は dialogue_agent に丸める
+                val = rules.get("dialogue_agent", {}).get("recommended_temperature")
+            if isinstance(val, (int, float)):
+                return float(val)
+
+        except Exception:
+            # 何があっても既定にフォールバック
+            pass
+
+        # 3) 既定値（後方互換）
+        if uc_key == "director":
+            return 0.3
         elif use_case == "creative":
-            return temp_config.get("creative_dialogue", {}).get("default", 0.7)
+            return 0.7
         else:
-            return temp_config.get("consistent_character", {}).get("default", 0.6)
+            return 0.6
     
     def check_model_exists(self, model_name: str) -> bool:
         """

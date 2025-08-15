@@ -6,6 +6,7 @@ import streamlit as st
 import ollama
 _HAS_OLLAMA = True
 from typing import List, Dict, Optional
+from app.core.model_utils import ModelManager
 
 @st.cache_data(ttl=300)
 def get_available_models() -> List[str]:
@@ -16,66 +17,17 @@ def get_available_models() -> List[str]:
     Returns:
         利用可能なモデル名のリスト
     """
+    mm = ModelManager()
+
     if not _HAS_OLLAMA:
         st.warning("⚠️ `ollama` ライブラリが見つかりません。ローカル実行時はollamaをインストールしてください。フォールバックのモデルリストを使用します。")
-        return ["qwen:7b", "gemma2:2b", "llama3.2:3b"]
+        return mm.get_fallback_models()
 
     try:
-        client = ollama.Client()
-        models_list = client.list()
+        available = mm.get_available_models()
+        sorted_models = mm.get_sorted_models(available)
 
-        model_names = []
-        for model in models_list.get('models', []):
-            model_name = model.get('name', '')
-            if model_name:
-                model_names.append(model_name)
-        # デバッグ: 実際のモデル名を確認
-        print(f"Available models: {model_names}")
-        
-        # 推奨モデルの優先順位（実際の名前に合わせて調整）
-        priority_models = [
-            # 量子化版（本番推奨）
-            "qwen2.5:7b-instruct-q4_K_M",
-            "qwen2.5:7b-instruct-q5_K_M",
-            
-            # 標準版
-            "qwen2.5:7b",
-            "qwen2.5:14b",
-            "qwen2.5:32b",
-            
-            # Qwen旧版
-            "qwen:7b",
-            "qwen:14b",
-            "qwen2:7b",
-            
-            # Gemma系列
-            "gemma3:4b",
-            "gemma3:12b",
-            "gemma2:2b",
-            "gemma2:9b",
-            "gemma2:27b",
-            "gemma:2b",
-            "gemma:7b",
-            
-            # その他推奨
-            "llama3.2:3b",
-            "llama3.1:8b",
-            "phi3:mini",
-            "mistral:7b"
-        ]
-        
-        # 優先順位でソート
-        available_priority = []
-        for model in priority_models:
-            if model in model_names:
-                available_priority.append(model)
-        
-        # その他のモデル
-        other_models = sorted([m for m in model_names if m not in available_priority])
-        
-        final_list = available_priority + other_models
-        
-        if not final_list:
+        if not sorted_models:
             st.warning("⚠️ Ollamaモデルが見つかりません。以下のコマンドでインストールしてください：")
             st.code("""
 # 推奨モデルのインストール
@@ -86,23 +38,18 @@ ollama pull gemma2:2b
 ollama pull qwen2.5:7b-instruct-q4_K_M
 ollama pull gemma3:4b
             """)
-            # フォールバック
-            return ["qwen:7b", "gemma2:2b"]
-        
-        return final_list
+            return mm.get_fallback_models()
+
+        return sorted_models
 
     except Exception as e:
-        # より詳細にハンドリングしてUIに表示
         err_msg = str(e)
         if isinstance(e, (OSError, IOError)):
             st.error(f"⚠️ モデル取得時のI/Oエラー: {err_msg}")
             st.info("ローカルの ollama サーバやファイルアクセスに問題がある可能性があります。`ollama serve` が起動しているか、権限/ソケットを確認してください。")
         else:
             st.warning(f"⚠️ モデル取得エラー: {err_msg}")
-
-        # エラー時のフォールバック（明示的に少数を返す）
-        fallback = ["qwen:7b", "gemma2:2b", "llama3.2:3b"]
-        return fallback
+        return mm.get_fallback_models()
 
 def check_and_suggest_model(model_name: str) -> Optional[str]:
     """
