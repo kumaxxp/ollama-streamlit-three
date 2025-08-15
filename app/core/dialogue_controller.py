@@ -233,17 +233,43 @@ class DialogueController:
         return self.state.turn_count % check_interval == 0
     
     def _perform_analysis(self) -> Dict[str, Any]:
-        """Director分析を実行（同期版）"""
-        recent_history = self.state.history[-4:] if len(self.state.history) >= 4 else self.state.history
+        """Director分析を実行（同期版）
+        Directorが期待する履歴（speaker/listener/message）形式に整形して渡す。
+        """
+        recent_history_raw = self.state.history[-4:] if len(self.state.history) >= 4 else self.state.history
+        # 2者会話前提でlistenerを相手に設定
+        agent_names: List[str] = list(self.agents.keys())
+        formatted: List[Dict[str, Any]] = []
+        for entry in recent_history_raw:
+            role = entry.get("role", "")
+            content = entry.get("content", "")
+            # content が dict（エラー情報等）の場合は message を抽出
+            if isinstance(content, dict):
+                message = content.get("message", "")
+            else:
+                message = str(content)
+
+            speaker_disp = self.agents[role].character.get("name", role) if role in self.agents else role or "不明"
+            # 相手（listener）を推定
+            if len(agent_names) == 2 and role in agent_names:
+                listener_key = agent_names[0] if agent_names[1] == role else agent_names[1]
+                listener_disp = self.agents[listener_key].character.get("name", listener_key)
+            else:
+                listener_disp = "相手"
+
+            formatted.append({
+                "speaker": speaker_disp,
+                "listener": listener_disp,
+                "message": message
+            })
         
         # 非同期メソッドを同期的に実行
         import asyncio
-        
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             result = loop.run_until_complete(
-                self.director.evaluate_dialogue(recent_history)
+                self.director.evaluate_dialogue(formatted)
             )
             loop.close()
             return result
