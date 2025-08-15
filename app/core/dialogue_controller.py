@@ -291,13 +291,30 @@ class DialogueController:
         if self.state.history:
             for entry in reversed(self.state.history):
                 if entry.get("role") == opponent_name:
-                    opponent_message = entry.get("content", "")
+                    last_content = entry.get("content", "")
+                    if isinstance(last_content, dict):
+                        opponent_message = last_content.get("message", "")
+                    else:
+                        opponent_message = str(last_content)
                     break
-        
+        # 直近履歴をUI用に整形（speaker/message 形式）
+        recent: List[Dict] = []
+        if self.state.history:
+            for h in self.state.history[-3:]:
+                role = h.get("role", "")
+                content = h.get("content", "")
+                if isinstance(content, dict):
+                    content = content.get("message", "")
+                display_name = self.agents[role].character.get("name", role) if role in self.agents else role
+                recent.append({
+                    "speaker": display_name,
+                    "message": str(content)
+                })
+
         return {
             "opponent_name": self.agents[opponent_name].character.get("name", opponent_name),
             "opponent_message": opponent_message,
-            "recent_history": self.state.history[-3:] if self.state.history else []
+            "recent_history": recent
         }
     
     def _update_history(self, speaker: str, content: str) -> None:
