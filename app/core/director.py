@@ -32,12 +32,12 @@ LONG_INTRO_PAT = re.compile(r"^(ところで|まず|ちなみに|さて|えっ�
 LIST_MARKERS_PAT = re.compile(r"^(?:[-*・]|\d+\.)\s", re.MULTILINE)
 
 # KPI (会話の手触りを数値制約)
-TURN_CHAR_MIN = 28
-TURN_CHAR_MAX = 110
-TURN_CHAR_MEDIAN_TARGET = 60
-MAX_SENTENCES = 2
-QUESTION_RATIO_TARGET = (0.35, 0.55)
-AIZUCHI_PROB_DEFAULT = 0.4
+TURN_CHAR_MIN = 30
+TURN_CHAR_MAX = 160
+TURN_CHAR_MEDIAN_TARGET = 85
+MAX_SENTENCES = 3
+QUESTION_RATIO_TARGET = (0.30, 0.55)
+AIZUCHI_PROB_DEFAULT = 0.35
 MAX_CONSECUTIVE_BY_SPEAKER = 2
 
 class NaturalConversationDirector:
@@ -200,16 +200,24 @@ class NaturalConversationDirector:
         if stats["question_ratio"] < lo:
             return "ask"
         # 長尺が続くなら短い相づち系
-        if stats["avg_chars_last3"] > 90:
+        if stats["avg_chars_last3"] > 110:
             return random.choice(["reflect", "agree_short", "handoff"])
         return random.choice(["answer", "reflect", "agree_short", "disagree_short"])
 
     def _decide_max_chars(self, stats: Dict[str, Any]) -> int:
-        if stats["avg_chars_last3"] > 90:
-            return 70
-        if stats["avg_chars_last3"] < 40:
-            return 90  # 少し伸ばす
-        return 80  # デフォルト
+        # メリハリ: たまにロングターンを許可して深掘りを促す
+        long_turn = random.random() < 0.22  # 22% でロング
+        if long_turn and stats["question_ratio"] <= QUESTION_RATIO_TARGET[1]:
+            # 長め: 120〜160
+            return random.choice([130, 140, 150, 160])
+        # 直近が長すぎる時は抑制
+        if stats["avg_chars_last3"] > 120:
+            return 85
+        # 短すぎる時は増量
+        if stats["avg_chars_last3"] < 45:
+            return 110
+        # 通常帯
+        return 95
 
     def _decide_aizuchi(self, stats: Dict[str, Any]) -> Dict[str, Any]:
         on = random.random() < AIZUCHI_PROB_DEFAULT
