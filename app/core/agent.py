@@ -203,6 +203,7 @@ class Agent:
         opponent_message = context.get('opponent_message', '')
         recent_history = context.get('recent_history', [])
         director_instruction = context.get('director_instruction', '')
+        director_findings = context.get('director_findings')
         
         # 基本プロンプト
         prompt_parts = [
@@ -228,6 +229,17 @@ class Agent:
         if director_instruction:
             prompt_parts.append(f"\n【アドバイス】")
             prompt_parts.append(director_instruction)
+
+        # Directorの検出/検証補足があれば追加（1ターンのみ有効）
+        if isinstance(director_findings, dict) and director_findings.get('entity_name'):
+            en = director_findings.get('entity_name')
+            vd = director_findings.get('verdict') or 'AMBIGUOUS'
+            ev = director_findings.get('evidence')
+            prompt_parts.append("\n【検証補足（Director）】")
+            prompt_parts.append(f"対象: 『{en}』 / 判定: {vd}")
+            if ev:
+                prompt_parts.append(f"根拠URL: {ev}")
+            prompt_parts.append("必要に応じてこの情報をやわらかく活用してください（確認・補足など）。")
         
         # 最新のDirective（長さ指示を含む）
         if self.turn_directives:
@@ -420,6 +432,21 @@ class Agent:
                 "role": "system",
                 "content": "【セッションコンテキスト】\n" + "\n".join(ctx_lines)
             })
+
+        # Directorの検出/検証情報があれば、補足として伝える（次ターンのみ）
+        findings = context.get("director_findings")
+        if isinstance(findings, dict) and findings.get("entity_name"):
+            fn = findings.get("entity_name")
+            vt = findings.get("verdict")
+            ev = findings.get("evidence")
+            note_lines = [
+                "【検証補足（Director）】",
+                f"直前の発話に登場した『{fn}』について、検証結果: {vt or 'AMBIGUOUS'}",
+            ]
+            if ev:
+                note_lines.append(f"根拠URL: {ev}")
+            note_lines.append("必要に応じてこの情報を活用してください。（やわらかい確認/補足が望ましい）")
+            messages.append({"role": "system", "content": "\n".join(note_lines)})
 
         # 開始/通常の分岐
         is_opening = (len(recent) == 0 and not opponent_msg)

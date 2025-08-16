@@ -18,6 +18,7 @@ import random
 import re
 from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime
+from .search_adapter import MCPWebSearchAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,16 @@ QUESTION_RATIO_TARGET = (0.30, 0.55)
 AIZUCHI_PROB_DEFAULT = 0.35
 MAX_CONSECUTIVE_BY_SPEAKER = 2
 
+# 一般語の簡易ストップワード（誤検出抑制。必要に応じて拡張）
+STOP_ENTITY_COMMON = set([
+    "負荷", "時間", "今日", "明日", "昨日", "世界", "社会", "問題", "方法", "議論",
+    "情報", "研究", "教育", "経済", "技術", "文化", "日本", "人間", "私", "あなた",
+    # 一般略語・会話頻出語（LLM抽出の誤検出を抑制）
+    "AI", "IT", "SNS", "CPU", "GPU", "OS", "PC", "NG", "OK",
+    # 会話の汎用語
+    "会話", "議題", "話題", "テーマ", "意見", "考え", "気持ち",
+])
+
 class NaturalConversationDirector:
     """会話のテンポ/尺/相槌を制御するディレクター。内容判断を最小化。"""
 
@@ -49,8 +60,10 @@ class NaturalConversationDirector:
         self.temperature = 0.2
         self.current_phase = "flow"  # flow→wrap
         self.turn_counter = 0
+
         # 検出した参加者名（会話ログの表示名）を A/B にマッピングするため保持
         self.participants: List[str] = []  # [nameA, nameB]
+
         # メトリクス
         self.metrics = {
             "avg_chars_last3": 0.0,
@@ -59,19 +72,28 @@ class NaturalConversationDirector:
             "last_speaker": None,            # 表示名
             "last_speaker_label": None,      # 'A' | 'B' | None
         }
+
         # --- 介入拡張: 固有名詞チェックとSoft Ack（軽い受け流し）状態 ---
-        # Web検索（MCP）利用の有無（将来拡張用・現状は未接続時はヒューリスティクスのみ）
-        self.use_mcp_search = False
+        # Web検索（MCP）利用の有無（導入済み: Wikipedia RESTを用いた簡易検証）
+        self.use_mcp_search = True
+        self.mcp_adapter = MCPWebSearchAdapter(language="ja")
+
         # 指摘された側への「軽い受け流し」継続指示
         self.soft_ack_enabled = True
         self.soft_ack_max_reminders = 2
         self.soft_ack_expire_window = 4  # 現在ターンからの有効ターン幅
+
         # セッション内キャッシュ/スケジューラ
         self.entity_cache = {}  # name -> {verdict, ts}
         self.pending_soft_ack = {}  # label('A'|'B')-> {remaining, expire_turn}
-        # LLMフォールバック: ヒューリスティクスで検出できない時のみ使用
+
+        # LLMベース抽出の利用設定
         self.use_llm_entity_fallback = True
         self.entity_llm_model = self.model_name
+        # ユーザー要望: アルゴ検出に頼らず LLM 抽出も常時併用する
+        self.always_llm_entity_scan = True
+        # ヒューリスティクス検出は無効化（LLM優先）
+        self.use_heuristics = False
 
     # ===== 公開API =====
     def plan_next_turn(self, dialogue_context: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -252,6 +274,29 @@ class NaturalConversationDirector:
         # 不明な名前の場合は A を既定に
         return "A"
 
+    # 参加者名の除外用ヘルパー
+    def _normalize_name_base(self, name: str) -> str:
+        """括弧や敬称を除いたベース名を返す。"""
+        if not name:
+            return ""
+        s = str(name).strip()
+        # 括弧注記を除去
+        s = s.split("（")[0].split("(")[0].strip()
+        # 代表的な敬称・呼び方を末尾から剥がす
+        for suf in ["さん", "ちゃん", "くん", "君", "様", "氏", "殿", "せんせい", "先生"]:
+            if s.endswith(suf):
+                s = s[: -len(suf)]
+                break
+        return s.strip()
+
+    def _is_participant_name(self, name: str) -> bool:
+        """候補名が会話参加者（Agent）の表示名/呼び方と一致するか。"""
+        base = self._normalize_name_base(name)
+        for p in self.participants or []:
+            if self._normalize_name_base(p) == base and base:
+                return True
+        return False
+
     # ===== 参考: 既存 evaluate_dialogue の互換API(機能拡張版) =====
     async def evaluate_dialogue(self, dialogue_context: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -264,6 +309,12 @@ class NaturalConversationDirector:
         """
         # まず通常のリズム計画を用意（フォールバック用）
         cmd_rhythm = self.plan_next_turn(dialogue_context)
+        debug_info: Dict[str, Any] = {
+            "heuristic_entities": [],
+            "llm_entities": [],
+            "selected_candidate": None,
+            "verification": None,
+        }
 
         # 直近の非Director発話を取得
         last_entry = None
@@ -282,61 +333,125 @@ class NaturalConversationDirector:
             target_label = self._other(offender_label)
             text = last_entry.get("message", "")
 
-            entities = self._extract_entities(text)
-            if entities:
-                # 代表エンティティのみ評価（最小実装）
-                ent = entities[0]
-                name = ent.get("name")
-                etype = ent.get("type", "ENTITY")
+            # 1) ヒューリスティクス抽出（無効化設定ならスキップ）
+            entities: List[Dict[str, Any]] = []
+            if getattr(self, "use_heuristics", True):
+                entities = self._extract_entities(text)
+                if entities:
+                    logger.debug(f"Director entity candidates: {entities}")
+                    debug_info["heuristic_entities"] = entities
 
-                needs_check = self._has_prominence_hint(text) or etype == "PERSON"
-                if needs_check and name:
-                    verdict = self._verify_entity(name, etype)
-                    if verdict in ("AMBIGUOUS", "NG"):
-                        # 訂正促し（ターゲット=offenderの反対側=現ターンの話者を想定）
-                        plan = self._build_entity_correction_plan(target_label, name)
-                        # Soft Ackを offender 側にスケジュール
-                        if self.soft_ack_enabled:
-                            self._schedule_soft_ack(offender_label)
+            # 2) LLM 抽出を併用（人物に限らず、未知用語も拾う）
+            llm_entities: List[Dict[str, Any]] = []
+            if self.use_llm_entity_fallback and self.client is not None and (
+                self.always_llm_entity_scan or not entities
+            ):
+                scan = self._llm_scan_entities(text)
+                if isinstance(scan, dict):
+                    llm_entities = [
+                        {"name": (e.get("name") or "").strip(), "type": (e.get("type") or "OTHER").upper()}
+                        for e in (scan.get("entities") or [])
+                        if isinstance(e, dict) and (e.get("name") or "").strip()
+                    ]
+                    if llm_entities:
+                        logger.debug(f"LLM entity candidates: {llm_entities}")
+                        debug_info["llm_entities"] = llm_entities
 
-                        return {
-                            "intervention_needed": True,
-                            "reason": "entity_check",
-                            "intervention_type": "entity_correction",
-                            "message": json.dumps(plan, ensure_ascii=False),
-                            "response_length_guide": "簡潔",
-                            "confidence": 0.7,
-                        }
-            else:
-                # LLMフォールバックで抽出を試みる（必要時のみ）
-                if self.use_llm_entity_fallback and self.client is not None:
-                    scan = self._llm_scan_entities(text)
-                    try:
-                        ent = None
-                        if isinstance(scan, dict):
-                            ents = scan.get("entities") or []
-                            # PERSON優先
-                            for e in ents:
-                                if (e.get("type") or "").upper() == "PERSON":
-                                    ent = e
-                                    break
-                            if not ent and ents:
-                                ent = ents[0]
-                        if ent and ent.get("name"):
-                            name = ent.get("name")
-                            plan = self._build_entity_correction_plan(target_label, name)
-                            if self.soft_ack_enabled:
-                                self._schedule_soft_ack(offender_label)
-                            return {
-                                "intervention_needed": True,
-                                "reason": "entity_check_llm",
-                                "intervention_type": "entity_correction",
-                                "message": json.dumps(plan, ensure_ascii=False),
-                                "response_length_guide": "簡潔",
-                                "confidence": 0.6,
-                            }
-                    except Exception:
-                        pass
+            # 3) 候補集合を決定（LLM優先。ヒューリスティクスは無効時は使わない）
+            merged: List[Dict[str, Any]] = []
+            seen = set()
+            for src in (llm_entities if not getattr(self, "use_heuristics", True) else (entities + llm_entities)):
+                n = src.get("name")
+                if n and n not in seen:
+                    seen.add(n)
+                    merged.append(src)
+
+            # 4) 候補選定: LLM抽出を優先（PERSON → その他未知語）。ヒューリスティクスは原則不使用
+            candidate = None
+            # 共通フィルタ: 一般語/略語を除外
+            def _passes(name: str) -> bool:
+                if not name:
+                    return False
+                n = name.strip()
+                # 自他の呼称（参加者名やその敬称付き）は除外
+                if self._is_participant_name(n):
+                    return False
+                if n in STOP_ENTITY_COMMON:
+                    return False
+                # 2〜3文字の全大文字略語は除外（例: AI, IT, OS）
+                import re as _re
+                if _re.fullmatch(r"[A-Z]{1,3}", n):
+                    return False
+                # 架空キャラクター/ニックネーム的な終端や表現は除外
+                if _re.search(r"(ちゃん|たん|っち|にゃん)$", n):
+                    return False
+                # 明示的なフィクション/キャラ系キーワードを含む場合は除外
+                fiction_keywords = [
+                    "キャラ", "キャラクター", "VTuber", "ゆるキャラ", "マスコット", "アバター",
+                    "二次元", "三次元化", "推し", "擬人化",
+                ]
+                if any(kw in n for kw in fiction_keywords):
+                    return False
+                # 英文氏名や複合語は許可
+                if " " in n:
+                    return True
+                # CJK名詞は2文字以上を許可、それ以外は3文字以上
+                if _re.search(r"[\u4E00-\u9FFF]", n):
+                    return len(n) >= 2
+                return len(n) >= 3
+
+            if llm_entities:
+                # PERSON優先
+                for e in llm_entities:
+                    if (e.get("type") or "").upper() == "PERSON" and _passes((e.get("name") or "").strip()):
+                        candidate = e
+                        break
+                if not candidate:
+                    for e in llm_entities:
+                        n = (e.get("name") or "").strip()
+                        if _passes(n):
+                            candidate = e
+                            break
+                if not candidate:
+                    candidate = llm_entities[0]
+            if not candidate and merged and getattr(self, "use_heuristics", True):
+                for e in merged:
+                    if (e.get("type") or "").upper() == "PERSON" and _passes((e.get("name") or "").strip()):
+                        candidate = e
+                        break
+                if not candidate:
+                    for e in merged:
+                        n = (e.get("name") or "").strip()
+                        if _passes(n):
+                            candidate = e
+                            break
+                if not candidate:
+                    candidate = merged[0]
+
+            if candidate and candidate.get("name"):
+                name = candidate.get("name")
+                etype = candidate.get("type", "ENTITY")
+                debug_info["selected_candidate"] = {"name": name, "type": etype}
+                logger.info(f"MCP verify check target='{name}' type={etype}")
+                verdict = self._verify_entity(name, etype)
+                evidence = None
+                ec = self.entity_cache.get(name)
+                if isinstance(ec, dict):
+                    evidence = ec.get("evidence")
+                debug_info["verification"] = {"verdict": verdict, "evidence": evidence}
+                if verdict in ("AMBIGUOUS", "NG"):
+                    plan = self._build_entity_correction_plan(target_label, name)
+                    if self.soft_ack_enabled:
+                        self._schedule_soft_ack(offender_label)
+                    return {
+                        "intervention_needed": True,
+                        "reason": "entity_check",
+                        "intervention_type": "entity_correction",
+                        "message": json.dumps(plan, ensure_ascii=False),
+                        "response_length_guide": "簡潔",
+                        "confidence": 0.75,
+                        "director_debug": debug_info,
+                    }
 
         # 2) Soft Ack（軽い受け流し）配布（ターゲット= offender 本人）
         if self.soft_ack_enabled and self.pending_soft_ack:
@@ -360,6 +475,7 @@ class NaturalConversationDirector:
                         "message": json.dumps(plan, ensure_ascii=False),
                         "response_length_guide": "簡潔",
                         "confidence": 0.8,
+                        "director_debug": debug_info,
                     }
                 # 期限切れは掃除
                 if now_turn > expire:
@@ -373,6 +489,7 @@ class NaturalConversationDirector:
             "message": json.dumps(cmd_rhythm, ensure_ascii=False),
             "response_length_guide": "簡潔",
             "confidence": 0.8,
+            "director_debug": debug_info,
         }
 
     # ===== 固有名詞チェック/Soft Ack 補助 =====
@@ -390,13 +507,25 @@ class NaturalConversationDirector:
                 cand = m.group(1).strip()
                 if cand:
                     results.append({"name": cand, "type": "PERSON"})
-            # 日本語: 漢字氏名（2-6文字）+ 助詞/敬称の直前
-            # 例: 橘為経が / 源頼朝は / 藤原道長の / 佐藤一郎さん
-            kanji_name_pat = r"([\u4E00-\u9FFF]{2,6})(?=(?:さん|氏|公|卿|殿|様)?[がはのをにとへ、。\s])"
-            for m in re.finditer(kanji_name_pat, text):
+            # 日本語: 漢字（2-6文字）+ 助詞/敬称の直前
+            # PERSON: 敬称が付く場合のみ
+            kanji_person_pat = r"([\u4E00-\u9FFF]{2,6})(?=(?:さん|氏|公|卿|殿|様)[がはのをにとへ、。\s])"
+            for m in re.finditer(kanji_person_pat, text):
                 cand = m.group(1).strip()
                 if cand:
                     results.append({"name": cand, "type": "PERSON"})
+            # ENTITY: 敬称なし（一般名詞の誤検出を回避するためストップワード除外）
+            kanji_entity_pat = r"([\u4E00-\u9FFF]{2,6})(?=[がはのをにとへ、。\s])"
+            for m in re.finditer(kanji_entity_pat, text):
+                cand = m.group(1).strip()
+                if cand and cand not in STOP_ENTITY_COMMON:
+                    results.append({"name": cand, "type": "ENTITY"})
+            # 未知語補助: 終端がかな等でも拾う（例: 「比重追跡砲みたい」など）
+            kanji_unknown_pat = r"([\u4E00-\u9FFF]{3,8})(?=(?:[ぁ-んァ-ン]|$))"
+            for m in re.finditer(kanji_unknown_pat, text):
+                cand = m.group(1).strip()
+                if cand and cand not in STOP_ENTITY_COMMON:
+                    results.append({"name": cand, "type": "ENTITY"})
             # カタカナ語（低優先）
             for m in re.finditer(r"[\u30A1-\u30F6\u30FC]{3,}", text):
                 cand = m.group(0)
@@ -425,16 +554,40 @@ class NaturalConversationDirector:
 
     def _verify_entity(self, name: str, etype: str) -> str:
         """エンティティの妥当性を判定する最小実装。
-        - use_mcp_search が有効なら将来ここでWeb検証を行う（現時点では未接続）
-        - ここでは保守的に "AMBIGUOUS" を返す（即断の誤検知を避ける）
+        - use_mcp_search が有効ならMCP/検索アダプタでWeb検証を行う
+        - 既定は保守的に "AMBIGUOUS"（即断の誤検知を避ける）
         戻り値: 'VERIFIED' | 'AMBIGUOUS' | 'NG'
         """
         cache = self.entity_cache.get(name)
         if cache:
             return cache.get("verdict", "AMBIGUOUS")
+
         verdict = "AMBIGUOUS"
-        # 例: 将来ここでMCP検索の結果からVERIFIED/NGを決定
-        self.entity_cache[name] = {"verdict": verdict, "ts": datetime.now().isoformat()}
+        evidence = None
+
+        if self.use_mcp_search and self.mcp_adapter:
+            try:
+                v, url = self.mcp_adapter.verify_entity(name, etype)
+                # アダプタの結果を標準化
+                if v in ("VERIFIED", "AMBIGUOUS", "NG"):
+                    verdict = v
+                    evidence = url
+                logger.info(
+                    "MCP result name='%s' verdict=%s evidence=%s",
+                    name,
+                    verdict,
+                    evidence,
+                )
+            except Exception:
+                logger.warning("MCP search failed for '%s'", name, exc_info=True)
+        else:
+            logger.debug("MCP disabled or adapter unavailable; fallback to AMBIGUOUS")
+
+        self.entity_cache[name] = {
+            "verdict": verdict,
+            "ts": datetime.now().isoformat(),
+            "evidence": evidence,
+        }
         return verdict
 
     def _llm_scan_entities(self, text: str) -> Optional[Dict[str, Any]]:
@@ -445,9 +598,15 @@ class NaturalConversationDirector:
         if not self.client:
             return None
         try:
+            # 参加者名（敬称含む）を抽出対象から除外する注記を付加
+            participants = [p for p in (self.participants or []) if p]
+            part_note = "、".join(participants) if participants else "(会話参加者名は未特定)"
             system = (
-                "あなたは対話監督の補助です。以下の日本語発話から固有名詞を抽出します。"
-                "特に人名(PERSON)を優先して検出してください。出力は次のJSONのみで、説明文は一切不要です。\n"
+                "あなたは対話監督の補助です。以下の日本語発話から 固有名詞 や 不明語(造語/誤用の可能性がある名詞句) を抽出します。"
+                "ただし次は抽出しないでください: (1) 一般語・略語（例: AI, IT, SNS, OK, NG など）、(2) テーマ/話題/意見などの汎用語、"
+                f"(3) 会話参加者（{part_note}）の名前やそれらへの呼びかけ（〜さん/〜ちゃん/〜くん 等）。"
+                "抽出対象は、現実世界の実在が想定される 公的人物(PERSON) や 組織/製品/地名/イベント等(ORG/OTHER) に限ります。"
+                "人名(PERSON)を優先しつつ、曖昧だが実在可能性のある専門用語は OTHER にしてください。 出力は次のJSONのみで、説明文は一切不要です。\n"
                 "{\n  \"entities\": [ {\"name\": string, \"type\": \"PERSON|ORG|OTHER\"} ... ]\n}"
             )
             user = f"発話:\n{text}\n\nJSONのみを出力してください。"

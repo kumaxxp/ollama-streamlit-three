@@ -310,10 +310,31 @@ with dialogue_container:
                 st.code(entry.get("user_prompt", ""))
         
         elif entry["type"] == "director":
-            # Director介入
-            if show_analysis or entry.get("important", False):
-                with st.expander("🎬 Director介入", expanded=False):
-                    st.write(entry["content"])
+            # Director介入（詳細表示を併置）
+            dbg = entry.get("debug") or {}
+            with st.expander("🎬 Director介入", expanded=entry.get("important", False)):
+                # 介入メッセージ
+                st.write(entry["content"])
+                # デバッグ（検出・検証の可視化）
+                if dbg:
+                    colL, colR = st.columns(2)
+                    with colL:
+                        st.caption("🔎 検出候補 (heuristic/LLM)")
+                        st.code(json.dumps({
+                            "heuristic": dbg.get("heuristic_entities"),
+                            "llm": dbg.get("llm_entities"),
+                        }, ensure_ascii=False, indent=2))
+                    with colR:
+                        st.caption("✅ 選択候補と検証")
+                        st.code(json.dumps({
+                            "selected": dbg.get("selected_candidate"),
+                            "verification": dbg.get("verification"),
+                        }, ensure_ascii=False, indent=2))
+        elif entry["type"] == "director_analysis_event":
+            # 任意のタイミングでのDirector分析スナップショット
+            if show_analysis:
+                with st.expander("🧪 Director分析スナップショット", expanded=False):
+                    st.code(json.dumps(entry["content"], ensure_ascii=False, indent=2))
 
 # 自動スクロール用の空要素
 if 'auto_scroll' in locals() and auto_scroll:
@@ -384,23 +405,25 @@ if st.session_state.is_running and st.session_state.controller and st.session_st
                     })
                 
                 elif event["type"] == "director_intervention":
-                    # Director介入を履歴に追加
+                    # Director介入（詳細と併せて可視化）
+                    intervention = event["data"]
+                    dbg = intervention.get("director_debug") if isinstance(intervention, dict) else None
                     st.session_state.dialogue_history.append({
                         "type": "director",
-                        "content": event['data']['message'],
+                        "content": intervention.get('message', ''),
                         "important": True,
-                        "timestamp": datetime.now().isoformat()
+                        "timestamp": datetime.now().isoformat(),
+                        "debug": dbg,
                     })
                 
                 elif event["type"] == "director_analysis":
-                    # Director分析を履歴に追加（詳細設定でONの場合のみ表示）
-                    if show_analysis:
-                        st.session_state.dialogue_history.append({
-                            "type": "director",
-                            "content": f"分析結果: {json.dumps(event['data'], ensure_ascii=False, indent=2)}",
-                            "important": False,
-                            "timestamp": datetime.now().isoformat()
-                        })
+                    # Director分析結果を履歴に常に保存（UIで並置表示に使用）
+                    analysis = event["data"]
+                    st.session_state.dialogue_history.append({
+                        "type": "director_analysis_event",
+                        "content": analysis,
+                        "timestamp": datetime.now().isoformat()
+                    })
                 
                 elif event["type"] == "turn_complete":
                     st.session_state.turn_count = event["data"]["turn_count"]

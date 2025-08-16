@@ -169,16 +169,25 @@ class DialogueController:
             # 介入が必要な場合
             if analysis.get("intervention_needed"):
                 intervention = self._generate_intervention(analysis)
+                # デバッグ情報を透過
+                if isinstance(analysis, dict) and analysis.get("director_debug"):
+                    intervention["director_debug"] = analysis.get("director_debug")
                 yield {"type": "director_intervention", "data": intervention}
                 
                 # エージェントへの指示を更新
                 self._update_agent_instructions(intervention)
+                # 検出/検証情報を次のプロンプト生成に利用できるよう保存
+                self._stash_director_findings(intervention)
         
-    # エージェントの応答を生成
+        # エージェントの応答を生成
         yield {"type": "agent_start", "data": {"agent": current_speaker}}
         
         # 同期的に応答を生成（簡略化のため）
         context = self._build_agent_context(current_speaker)
+        # 直近のディレクター検出情報があれば、コンテキストに付与
+        findings = getattr(self, "_last_director_findings", None)
+        if findings:
+            context["director_findings"] = findings
 
         # 事前にsystem/userプロンプトを生成してUIに渡す
         try:
@@ -186,6 +195,9 @@ class DialogueController:
             system_prompt = agent_obj._build_system_prompt()
             user_prompt = agent_obj.build_prompt(context)
             yield {"type": "agent_prompts", "data": {"agent": current_speaker, "system_prompt": system_prompt, "user_prompt": user_prompt}}
+            # findings は1ターンのみ有効にするため使用後クリア
+            if hasattr(self, "_last_director_findings"):
+                self._last_director_findings = None
         except Exception:
             # 生成失敗しても続行
             system_prompt = None
@@ -225,6 +237,28 @@ class DialogueController:
         self._update_metrics(turn_time, len(response))
         
         yield {"type": "turn_complete", "data": self.get_state_summary()}
+
+    def _stash_director_findings(self, intervention: Dict[str, Any]) -> None:
+        """Directorの検出/検証情報を次のプロンプトで使えるよう保持する。"""
+        try:
+            dbg = intervention.get("director_debug") if isinstance(intervention, dict) else None
+            if not isinstance(dbg, dict):
+                return
+            sel = dbg.get("selected_candidate") or {}
+            ver = dbg.get("verification") or {}
+            name = sel.get("name")
+            if not name:
+                return
+            self._last_director_findings = {
+                "entity_name": name,
+                "entity_type": sel.get("type"),
+                "verdict": ver.get("verdict"),
+                "evidence": ver.get("evidence"),
+                "timestamp": datetime.now().isoformat(),
+            }
+        except Exception:
+            # 非致命
+            self._last_director_findings = None
     
     def _should_analyze(self) -> bool:
         """分析を実行すべきか判定"""
