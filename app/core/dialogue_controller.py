@@ -249,11 +249,19 @@ class DialogueController:
             name = sel.get("name")
             if not name:
                 return
+            # evidence_text は長い場合があるため抜粋を作る
+            evidence_text = ver.get("evidence_text") if isinstance(ver, dict) else None
+            excerpt = None
+            if isinstance(evidence_text, str) and evidence_text.strip():
+                txt = evidence_text.strip().replace("\n", " ")
+                excerpt = (txt[:280] + ("…" if len(txt) > 280 else ""))
             self._last_director_findings = {
                 "entity_name": name,
                 "entity_type": sel.get("type"),
                 "verdict": ver.get("verdict"),
                 "evidence": ver.get("evidence"),
+                "evidence_text": evidence_text,
+                "evidence_excerpt": excerpt,
                 "timestamp": datetime.now().isoformat(),
             }
         except Exception:
@@ -536,6 +544,14 @@ class DialogueController:
         for agent in self.agents.values():
             if hasattr(agent, 'reset'):
                 agent.reset()
+        # Directorのセッションキャッシュをクリア
+        try:
+            if self.director and hasattr(self.director, 'entity_cache'):
+                self.director.entity_cache.clear()
+            if self.director and hasattr(self.director, 'pending_soft_ack'):
+                self.director.pending_soft_ack.clear()
+        except Exception:
+            pass
     
     def get_state_summary(self) -> Dict[str, Any]:
         """状態サマリを取得"""

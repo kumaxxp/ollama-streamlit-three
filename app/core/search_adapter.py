@@ -30,28 +30,33 @@ class MCPWebSearchAdapter:
         - No hits -> 'NG'
         Returns: (verdict, evidence_url)
         """
+        v, url, _ = self.verify_entity_detail(name, etype)
+        return (v, url)
+
+    def verify_entity_detail(self, name: str, etype: str = "PERSON") -> Tuple[str, Optional[str], Optional[str]]:
+        """
+        詳細版: (verdict, evidence_url, evidence_text[extract]) を返す。
+        """
         if not httpx:
-            return ("AMBIGUOUS", None)
-        # Normalize name
-        q = name.strip()
+            return ("AMBIGUOUS", None, None)
+        q = (name or "").strip()
         if not q:
-            return ("AMBIGUOUS", None)
+            return ("AMBIGUOUS", None, None)
         base = f"https://{self.lang}.wikipedia.org"
         # 1) Try exact title summary
         summary_url = f"{base}/api/rest_v1/page/summary/{httpx.URL(q).raw_path.decode('utf-8')}"
-        verdict, url = self._fetch_summary(summary_url)
+        verdict, url, extract = self._fetch_summary_with_text(summary_url)
         if verdict:
-            return (verdict, url)
+            return (verdict, url, extract)
         # 2) Fallback: title search
         search_url = f"{base}/w/rest.php/v1/search/title?q={httpx.QueryParams({'q': q, 'limit': 3})['q']}&limit=3"
         try:
             with httpx.Client(timeout=self.timeout) as client:
                 r = client.get(search_url, headers={"accept": "application/json"})
                 if r.status_code != 200:
-                    return ("AMBIGUOUS", None)
+                    return ("AMBIGUOUS", None, None)
                 data = r.json()
                 pages = (data or {}).get("pages") or []
-                # Prefer exact or startswith match
                 candidate = None
                 for p in pages:
                     title = (p.get("title") or "").strip()
@@ -62,11 +67,11 @@ class MCPWebSearchAdapter:
                     candidate = (pages[0].get("title") or "").strip()
                 if candidate:
                     s_url = f"{base}/api/rest_v1/page/summary/{httpx.URL(candidate).raw_path.decode('utf-8')}"
-                    v2, url2 = self._fetch_summary(s_url)
-                    return (v2 or "AMBIGUOUS", url2)
+                    v2, u2, ex2 = self._fetch_summary_with_text(s_url)
+                    return (v2 or "AMBIGUOUS", u2, ex2)
         except Exception:
-            return ("AMBIGUOUS", None)
-        return ("AMBIGUOUS", None)
+            return ("AMBIGUOUS", None, None)
+        return ("AMBIGUOUS", None, None)
 
     def _fetch_summary(self, url: str) -> Tuple[Optional[str], Optional[str]]:
         try:
@@ -88,3 +93,24 @@ class MCPWebSearchAdapter:
                 return ("AMBIGUOUS", page_url)
         except Exception:
             return (None, None)
+
+    def _fetch_summary_with_text(self, url: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                r = client.get(url, headers={"accept": "application/json"})
+                if r.status_code == 404:
+                    return (None, None, None)
+                if r.status_code != 200:
+                    return (None, None, None)
+                data = r.json()
+                ptype = data.get("type")
+                content_urls = ((data.get("content_urls") or {}).get("desktop") or {})
+                page_url = content_urls.get("page")
+                extract = data.get("extract")
+                if ptype == "standard":
+                    return ("VERIFIED", page_url, extract)
+                if ptype == "disambiguation":
+                    return ("AMBIGUOUS", page_url, extract)
+                return ("AMBIGUOUS", page_url, extract)
+        except Exception:
+            return (None, None, None)

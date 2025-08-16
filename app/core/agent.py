@@ -235,10 +235,13 @@ class Agent:
             en = director_findings.get('entity_name')
             vd = director_findings.get('verdict') or 'AMBIGUOUS'
             ev = director_findings.get('evidence')
+            ex = director_findings.get('evidence_excerpt')
             prompt_parts.append("\n【検証補足（Director）】")
             prompt_parts.append(f"対象: 『{en}』 / 判定: {vd}")
             if ev:
                 prompt_parts.append(f"根拠URL: {ev}")
+            if ex:
+                prompt_parts.append("根拠要約: " + ex)
             prompt_parts.append("必要に応じてこの情報をやわらかく活用してください（確認・補足など）。")
         
         # 最新のDirective（長さ指示を含む）
@@ -439,12 +442,15 @@ class Agent:
             fn = findings.get("entity_name")
             vt = findings.get("verdict")
             ev = findings.get("evidence")
+            ex = findings.get("evidence_excerpt")
             note_lines = [
                 "【検証補足（Director）】",
                 f"直前の発話に登場した『{fn}』について、検証結果: {vt or 'AMBIGUOUS'}",
             ]
             if ev:
                 note_lines.append(f"根拠URL: {ev}")
+            if ex:
+                note_lines.append("根拠要約: " + ex)
             note_lines.append("必要に応じてこの情報を活用してください。（やわらかい確認/補足が望ましい）")
             messages.append({"role": "system", "content": "\n".join(note_lines)})
 

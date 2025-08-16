@@ -84,7 +84,7 @@ class NaturalConversationDirector:
         self.soft_ack_expire_window = 4  # 現在ターンからの有効ターン幅
 
         # セッション内キャッシュ/スケジューラ
-        self.entity_cache = {}  # name -> {verdict, ts}
+        self.entity_cache = {}  # name -> {verdict, evidence, evidence_text, ts}
         self.pending_soft_ack = {}  # label('A'|'B')-> {remaining, expire_turn}
 
         # LLMベース抽出の利用設定
@@ -435,10 +435,12 @@ class NaturalConversationDirector:
                 logger.info(f"MCP verify check target='{name}' type={etype}")
                 verdict = self._verify_entity(name, etype)
                 evidence = None
+                evidence_text = None
                 ec = self.entity_cache.get(name)
                 if isinstance(ec, dict):
                     evidence = ec.get("evidence")
-                debug_info["verification"] = {"verdict": verdict, "evidence": evidence}
+                    evidence_text = ec.get("evidence_text")
+                debug_info["verification"] = {"verdict": verdict, "evidence": evidence, "evidence_text": evidence_text}
                 if verdict in ("AMBIGUOUS", "NG"):
                     plan = self._build_entity_correction_plan(target_label, name)
                     if self.soft_ack_enabled:
@@ -564,14 +566,17 @@ class NaturalConversationDirector:
 
         verdict = "AMBIGUOUS"
         evidence = None
+        evidence_text = None
 
         if self.use_mcp_search and self.mcp_adapter:
             try:
-                v, url = self.mcp_adapter.verify_entity(name, etype)
+                # 既存キャッシュにテキストがなければ詳細版を取得
+                v, url, extract = self.mcp_adapter.verify_entity_detail(name, etype)
                 # アダプタの結果を標準化
                 if v in ("VERIFIED", "AMBIGUOUS", "NG"):
                     verdict = v
                     evidence = url
+                    evidence_text = extract
                 logger.info(
                     "MCP result name='%s' verdict=%s evidence=%s",
                     name,
@@ -587,6 +592,7 @@ class NaturalConversationDirector:
             "verdict": verdict,
             "ts": datetime.now().isoformat(),
             "evidence": evidence,
+            "evidence_text": evidence_text,
         }
         return verdict
 
