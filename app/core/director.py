@@ -59,6 +59,19 @@ class NaturalConversationDirector:
             "last_speaker": None,            # 表示名
             "last_speaker_label": None,      # 'A' | 'B' | None
         }
+        # --- 介入拡張: 固有名詞チェックとSoft Ack（軽い受け流し）状態 ---
+        # Web検索（MCP）利用の有無（将来拡張用・現状は未接続時はヒューリスティクスのみ）
+        self.use_mcp_search = False
+        # 指摘された側への「軽い受け流し」継続指示
+        self.soft_ack_enabled = True
+        self.soft_ack_max_reminders = 2
+        self.soft_ack_expire_window = 4  # 現在ターンからの有効ターン幅
+        # セッション内キャッシュ/スケジューラ
+        self.entity_cache = {}  # name -> {verdict, ts}
+        self.pending_soft_ack = {}  # label('A'|'B')-> {remaining, expire_turn}
+        # LLMフォールバック: ヒューリスティクスで検出できない時のみ使用
+        self.use_llm_entity_fallback = True
+        self.entity_llm_model = self.model_name
 
     # ===== 公開API =====
     def plan_next_turn(self, dialogue_context: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -231,18 +244,275 @@ class NaturalConversationDirector:
         # 不明な名前の場合は A を既定に
         return "A"
 
-    # ===== 参考: 既存 evaluate_dialogue の互換API(必要なら使用) =====
+    # ===== 参考: 既存 evaluate_dialogue の互換API(機能拡張版) =====
     async def evaluate_dialogue(self, dialogue_context: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """下位互換: 旧API呼び出し箇所のための非同期関数。v2では turn_style を返す。"""
-        cmd = self.plan_next_turn(dialogue_context)
+        """
+        旧APIの互換インターフェース。
+        優先度:
+          1) 固有名詞チェックに基づく訂正促し（entity_correction）
+          2) 指摘された側への軽い受け流しのトーン指示（tone_guidance_soft_ack）
+          3) リズム/長さ/話法のガイド（length_tempo_speech_act）
+        すべて既存のコントローラ/UIに無改変で流せる形式で返す。
+        """
+        # まず通常のリズム計画を用意（フォールバック用）
+        cmd_rhythm = self.plan_next_turn(dialogue_context)
+
+        # 直近の非Director発話を取得
+        last_entry = None
+        for m in reversed(dialogue_context):
+            if m.get("speaker") and m.get("speaker") != "Director":
+                last_entry = m
+                break
+
+        # 参加者A/Bの特定を更新（_analyzeはplan_next_turn内でも呼ばれているが安全のため）
+        _ = self._analyze(dialogue_context)
+
+        # 1) 固有名詞チェック → 訂正促し（指摘するのは「発言者と別のAI」= 直近発話者の反対側）
+        if last_entry and isinstance(last_entry.get("message"), str):
+            offender_disp = last_entry.get("speaker") or ""
+            offender_label = self._label_of(offender_disp)
+            target_label = self._other(offender_label)
+            text = last_entry.get("message", "")
+
+            entities = self._extract_entities(text)
+            if entities:
+                # 代表エンティティのみ評価（最小実装）
+                ent = entities[0]
+                name = ent.get("name")
+                etype = ent.get("type", "ENTITY")
+
+                needs_check = self._has_prominence_hint(text) or etype == "PERSON"
+                if needs_check and name:
+                    verdict = self._verify_entity(name, etype)
+                    if verdict in ("AMBIGUOUS", "NG"):
+                        # 訂正促し（ターゲット=offenderの反対側=現ターンの話者を想定）
+                        plan = self._build_entity_correction_plan(target_label, name)
+                        # Soft Ackを offender 側にスケジュール
+                        if self.soft_ack_enabled:
+                            self._schedule_soft_ack(offender_label)
+
+                        return {
+                            "intervention_needed": True,
+                            "reason": "entity_check",
+                            "intervention_type": "entity_correction",
+                            "message": json.dumps(plan, ensure_ascii=False),
+                            "response_length_guide": "簡潔",
+                            "confidence": 0.7,
+                        }
+            else:
+                # LLMフォールバックで抽出を試みる（必要時のみ）
+                if self.use_llm_entity_fallback and self.client is not None:
+                    scan = self._llm_scan_entities(text)
+                    try:
+                        ent = None
+                        if isinstance(scan, dict):
+                            ents = scan.get("entities") or []
+                            # PERSON優先
+                            for e in ents:
+                                if (e.get("type") or "").upper() == "PERSON":
+                                    ent = e
+                                    break
+                            if not ent and ents:
+                                ent = ents[0]
+                        if ent and ent.get("name"):
+                            name = ent.get("name")
+                            plan = self._build_entity_correction_plan(target_label, name)
+                            if self.soft_ack_enabled:
+                                self._schedule_soft_ack(offender_label)
+                            return {
+                                "intervention_needed": True,
+                                "reason": "entity_check_llm",
+                                "intervention_type": "entity_correction",
+                                "message": json.dumps(plan, ensure_ascii=False),
+                                "response_length_guide": "簡潔",
+                                "confidence": 0.6,
+                            }
+                    except Exception:
+                        pass
+
+        # 2) Soft Ack（軽い受け流し）配布（ターゲット= offender 本人）
+        if self.soft_ack_enabled and self.pending_soft_ack:
+            # 期限内かつ残数>0のものを1件配布
+            now_turn = self.turn_counter
+            for label, st in list(self.pending_soft_ack.items()):
+                remaining = st.get("remaining", 0)
+                expire = st.get("expire_turn", 0)
+                if remaining > 0 and now_turn <= expire:
+                    plan = self._build_soft_ack_plan(label)
+                    # 消費
+                    st["remaining"] = remaining - 1
+                    if st["remaining"] <= 0:
+                        self.pending_soft_ack.pop(label, None)
+                    else:
+                        self.pending_soft_ack[label] = st
+                    return {
+                        "intervention_needed": True,
+                        "reason": "soft_ack_tone",
+                        "intervention_type": "tone_guidance_soft_ack",
+                        "message": json.dumps(plan, ensure_ascii=False),
+                        "response_length_guide": "簡潔",
+                        "confidence": 0.8,
+                    }
+                # 期限切れは掃除
+                if now_turn > expire:
+                    self.pending_soft_ack.pop(label, None)
+
+        # 3) フォールバック: リズム/長さ/話法ガイド
         return {
             "intervention_needed": True,
             "reason": "rhythm_control",
             "intervention_type": "length_tempo_speech_act",
-            "message": json.dumps(cmd, ensure_ascii=False),  # 互換のため文字列化
+            "message": json.dumps(cmd_rhythm, ensure_ascii=False),
             "response_length_guide": "簡潔",
             "confidence": 0.8,
         }
+
+    # ===== 固有名詞チェック/Soft Ack 補助 =====
+    def _extract_entities(self, text: str) -> List[Dict[str, str]]:
+        """最小ヒューリスティクスで固有名詞候補を抽出。
+        - ラテン系氏名: "John Smith" のような先頭大文字2語以上
+        - 日本語氏名（漢字連続）: 2-6 文字 + 後続助詞/敬称（が/は/の/さん/氏 等）
+        - カタカナ連続: 3文字以上（精度低いので低優先）
+        返り値: [{name, type}]
+        """
+        results: List[Dict[str, str]] = []
+        try:
+            # 英文氏名っぽい
+            for m in re.finditer(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b", text):
+                cand = m.group(1).strip()
+                if cand:
+                    results.append({"name": cand, "type": "PERSON"})
+            # 日本語: 漢字氏名（2-6文字）+ 助詞/敬称の直前
+            # 例: 橘為経が / 源頼朝は / 藤原道長の / 佐藤一郎さん
+            kanji_name_pat = r"([\u4E00-\u9FFF]{2,6})(?=(?:さん|氏|公|卿|殿|様)?[がはのをにとへ、。\s])"
+            for m in re.finditer(kanji_name_pat, text):
+                cand = m.group(1).strip()
+                if cand:
+                    results.append({"name": cand, "type": "PERSON"})
+            # カタカナ語（低優先）
+            for m in re.finditer(r"[\u30A1-\u30F6\u30FC]{3,}", text):
+                cand = m.group(0)
+                # 明らかな一般語は除外したいが最小実装ではそのまま
+                if cand and len(cand) >= 3:
+                    # 種別は未判定
+                    results.append({"name": cand, "type": "ENTITY"})
+        except Exception:
+            pass
+        # 重複除去（先頭優先）
+        seen = set()
+        unique: List[Dict[str, str]] = []
+        for r in results:
+            key = r.get("name")
+            if key and key not in seen:
+                seen.add(key)
+                unique.append(r)
+        return unique[:3]
+
+    def _has_prominence_hint(self, text: str) -> bool:
+        """著名性や役職を示すヒント語が含まれるかの簡易判定。"""
+        hints = [
+            "有名", "著名", "俳優", "女優", "歌手", "大統領", "首相", "CEO", "創業者", "ノーベル", "受賞",
+        ]
+        return any(h in text for h in hints)
+
+    def _verify_entity(self, name: str, etype: str) -> str:
+        """エンティティの妥当性を判定する最小実装。
+        - use_mcp_search が有効なら将来ここでWeb検証を行う（現時点では未接続）
+        - ここでは保守的に "AMBIGUOUS" を返す（即断の誤検知を避ける）
+        戻り値: 'VERIFIED' | 'AMBIGUOUS' | 'NG'
+        """
+        cache = self.entity_cache.get(name)
+        if cache:
+            return cache.get("verdict", "AMBIGUOUS")
+        verdict = "AMBIGUOUS"
+        # 例: 将来ここでMCP検索の結果からVERIFIED/NGを決定
+        self.entity_cache[name] = {"verdict": verdict, "ts": datetime.now().isoformat()}
+        return verdict
+
+    def _llm_scan_entities(self, text: str) -> Optional[Dict[str, Any]]:
+        """LLMに発話から固有名詞（特にPERSON）抽出を依頼し、JSONで受け取るフォールバック。
+        期待出力:
+        { "entities": [ {"name": str, "type": "PERSON|ORG|OTHER"}, ... ] }
+        """
+        if not self.client:
+            return None
+        try:
+            system = (
+                "あなたは対話監督の補助です。以下の日本語発話から固有名詞を抽出します。"
+                "特に人名(PERSON)を優先して検出してください。出力は次のJSONのみで、説明文は一切不要です。\n"
+                "{\n  \"entities\": [ {\"name\": string, \"type\": \"PERSON|ORG|OTHER\"} ... ]\n}"
+            )
+            user = f"発話:\n{text}\n\nJSONのみを出力してください。"
+            resp = self.client.chat(
+                model=self.entity_llm_model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                options={"temperature": 0.1},
+                stream=False,
+            )
+            content = (resp.get("message") or {}).get("content")
+            if not content:
+                return None
+            # JSON抽出（前後にノイズがあれば抜き出し）
+            content_str = str(content).strip()
+            start = content_str.find("{")
+            end = content_str.rfind("}")
+            if start >= 0 and end > start:
+                content_str = content_str[start:end+1]
+            data = json.loads(content_str)
+            if isinstance(data, dict) and "entities" in data:
+                return data
+        except Exception:
+            return None
+        return None
+
+    def _schedule_soft_ack(self, offender_label: str) -> None:
+        remaining = self.soft_ack_max_reminders
+        expire = self.turn_counter + self.soft_ack_expire_window
+        prev = self.pending_soft_ack.get(offender_label, {})
+        # 既存があれば上限で更新
+        if prev:
+            remaining = max(prev.get("remaining", 0), remaining)
+            expire = max(prev.get("expire_turn", 0), expire)
+        self.pending_soft_ack[offender_label] = {"remaining": remaining, "expire_turn": expire}
+
+    def _build_entity_correction_plan(self, target_label: str, entity_name: str) -> Dict[str, Any]:
+        """指摘する側（発言者の反対側）向けの短い指摘スタイル計画を返す。"""
+        # 軽い相づち例に「指摘のニュアンス」を埋め込む（UI側で例が表示される）
+        example = f"『{entity_name}』は確認が必要かも"
+        plan = {
+            "turn_style": {
+                "speaker": target_label,
+                "length": {"max_chars": 70, "max_sentences": 1},
+                "preface": {"aizuchi": True, "aizuchi_list": [example], "prob": 1.0},
+                "speech_act": "disagree_short",
+                "follow_up": "none",
+                "ban": ["praise", "list_format", "long_intro"],
+            },
+            "cadence": {"avoid_consecutive_monologues": True},
+            "closing_hint": "続ける",
+        }
+        return plan
+
+    def _build_soft_ack_plan(self, offender_label: str) -> Dict[str, Any]:
+        """指摘された側向けの“軽い受け流し”トーン指示。複数ターン配布。"""
+        # 例フレーズを相づちに埋め込む（実装制約上、自然文をここで示唆）
+        examples = ["そうだっけ？", "あれ？違ったかも"]
+        plan = {
+            "turn_style": {
+                "speaker": offender_label,
+                "length": {"max_chars": 60, "max_sentences": 1},
+                "preface": {"aizuchi": True, "aizuchi_list": examples, "prob": 1.0},
+                "speech_act": "agree_short",
+                "follow_up": "none",
+                "ban": ["praise", "list_format", "long_intro"],
+            },
+            "cadence": {"avoid_consecutive_monologues": True},
+            "closing_hint": "続ける",
+        }
+        return plan
 
     # ===== Judgeユーティリティ(任意) =====
     @staticmethod
@@ -252,7 +522,7 @@ class NaturalConversationDirector:
         if len(text) > max_chars:
             violations.append("too_long")
         # 文数
-        sentences = re.split(r"[。.!?？！]+", text.strip())
+        sentences = re.split(r"[。.!?！？]+", text.strip())
         sentences = [s for s in sentences if s]
         if len(sentences) > max_sentences:
             violations.append("too_many_sentences")
@@ -266,6 +536,8 @@ class NaturalConversationDirector:
         if LONG_INTRO_PAT.search(text):
             violations.append("long_intro")
         return {"ok": not violations, "violations": violations}
+
+    # （重複定義のクリーンアップ済み。以降は auto_repair のみ保持）
 
     @staticmethod
     def auto_repair(text: str, max_chars: int = 90) -> str:
