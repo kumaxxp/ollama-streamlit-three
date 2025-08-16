@@ -324,11 +324,16 @@ with dialogue_container:
                             "heuristic": dbg.get("heuristic_entities"),
                             "llm": dbg.get("llm_entities"),
                         }, ensure_ascii=False, indent=2))
+                        if dbg.get("holistic_text"):
+                            st.caption("🧠 ホリスティックレビュー(テキスト)")
+                            st.write(dbg.get("holistic_text"))
                     with colR:
-                        st.caption("✅ 選択候補と検証")
+                        st.caption("✅ 候補と検証")
                         st.code(json.dumps({
                             "selected": dbg.get("selected_candidate"),
                             "verification": dbg.get("verification"),
+                            "all_candidates": dbg.get("all_candidates"),
+                            "verifications": dbg.get("verifications"),
                         }, ensure_ascii=False, indent=2))
         elif entry["type"] == "director_analysis_event":
             # 任意のタイミングでのDirector分析スナップショット

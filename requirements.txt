@@ -16,6 +16,10 @@ python-dotenv==1.0.1
 watchdog==4.0.0
 httpx>=0.25,<1
 
+# Optional: Gemini 2.0 Flash integration
+# google-generativeai はAPIキーがある場合のみ必要
+google-generativeai>=0.8.0
+
 # Export formats
 openpyxl==3.1.2
 xlsxwriter==3.1.9

@@ -244,26 +244,36 @@ class DialogueController:
             dbg = intervention.get("director_debug") if isinstance(intervention, dict) else None
             if not isinstance(dbg, dict):
                 return
+            findings: Dict[str, Any] = {"timestamp": datetime.now().isoformat()}
+
+            # エンティティ検証（従来）
             sel = dbg.get("selected_candidate") or {}
             ver = dbg.get("verification") or {}
             name = sel.get("name")
-            if not name:
-                return
-            # evidence_text は長い場合があるため抜粋を作る
-            evidence_text = ver.get("evidence_text") if isinstance(ver, dict) else None
-            excerpt = None
-            if isinstance(evidence_text, str) and evidence_text.strip():
-                txt = evidence_text.strip().replace("\n", " ")
-                excerpt = (txt[:280] + ("…" if len(txt) > 280 else ""))
-            self._last_director_findings = {
-                "entity_name": name,
-                "entity_type": sel.get("type"),
-                "verdict": ver.get("verdict"),
-                "evidence": ver.get("evidence"),
-                "evidence_text": evidence_text,
-                "evidence_excerpt": excerpt,
-                "timestamp": datetime.now().isoformat(),
-            }
+            if name:
+                # evidence_text は長い場合があるため抜粋を作る
+                evidence_text = ver.get("evidence_text") if isinstance(ver, dict) else None
+                excerpt = None
+                if isinstance(evidence_text, str) and evidence_text.strip():
+                    txt = evidence_text.strip().replace("\n", " ")
+                    excerpt = (txt[:280] + ("…" if len(txt) > 280 else ""))
+                findings.update({
+                    "entity_name": name,
+                    "entity_type": sel.get("type"),
+                    "verdict": ver.get("verdict"),
+                    "evidence": ver.get("evidence"),
+                    "evidence_text": evidence_text,
+                    "evidence_excerpt": excerpt,
+                })
+
+            # ホリスティックレビュー（文章）
+            htext = dbg.get("holistic_text")
+            if isinstance(htext, str) and htext.strip():
+                findings["holistic_text"] = htext.strip()
+
+            # 何かしらあれば保存
+            if len(findings) > 1:  # timestamp 以外がある
+                self._last_director_findings = findings
         except Exception:
             # 非致命
             self._last_director_findings = None
@@ -367,7 +377,21 @@ class DialogueController:
             max_chars = length.get("max_chars")
             max_sent = length.get("max_sentences")
             aizuchi_on = preface.get("aizuchi")
-            aizuchi_list = preface.get("aizuchi_list") or []
+            # 防御的にフラット化+文字列化
+            raw_aizuchi = preface.get("aizuchi_list") or []
+            aizuchi_list: List[str] = []
+            try:
+                if isinstance(raw_aizuchi, list):
+                    for it in raw_aizuchi:
+                        if isinstance(it, list):
+                            aizuchi_list.extend([str(x) for x in it])
+                        else:
+                            aizuchi_list.append(str(it))
+                elif isinstance(raw_aizuchi, (str, int, float)):
+                    aizuchi_list = [str(raw_aizuchi)]
+            except Exception:
+                # 型不整合時は空扱い
+                aizuchi_list = []
 
             nl_parts: List[str] = []
             # 話法

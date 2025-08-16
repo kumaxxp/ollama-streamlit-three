@@ -14,6 +14,7 @@ Director AI (v2) — Natural Conversation Director
 from __future__ import annotations
 import json
 import logging
+import os
 import random
 import re
 from typing import Dict, List, Optional, Tuple, Any
@@ -48,64 +49,214 @@ STOP_ENTITY_COMMON = set([
     # 一般略語・会話頻出語（LLM抽出の誤検出を抑制）
     "AI", "IT", "SNS", "CPU", "GPU", "OS", "PC", "NG", "OK",
     # 会話の汎用語
-    "会話", "議題", "話題", "テーマ", "意見", "考え", "気持ち",
+    "会話", "議題", "話題", "テーマ", "意見", "考え", "気持ち", "全部", "本当", "自然", "数字", "欲求",
+    "結局", "古都", "本物", "再現", "データ", "解釈",
 ])
+
+class RateLimitManager:
+    """Gemini API レート制限の簡易管理（オフラインでも動作可能なスタブ）。"""
+
+    def __init__(self):
+        # 既定値（無料枠の目安）
+        self.minute_limit = 15
+        self.daily_limit = 1500
+        self.minute_used = 0
+        self.daily_used = 0
+
+    def get_current_usage(self) -> Dict[str, Any]:
+        return {
+            "minute": {"used": self.minute_used, "limit": self.minute_limit, "remaining": max(0, self.minute_limit - self.minute_used)},
+            "daily": {"used": self.daily_used, "limit": self.daily_limit, "remaining": max(0, self.daily_limit - self.daily_used)},
+            "reset_time": None,
+        }
+
+    def should_use_cloud(self) -> Tuple[bool, str]:
+        usage = self.get_current_usage()
+        daily_percent = usage["daily"]["remaining"] / usage["daily"]["limit"] if usage["daily"]["limit"] else 0.0
+        if daily_percent < 0.2:
+            return False, "daily_limit_warning"
+        if usage["minute"]["remaining"] < 2:
+            return False, "minute_limit"
+        return True, "ok"
+
+    def note_call(self, n: int = 1):
+        self.minute_used += n
+        self.daily_used += n
+
+
+class CostOptimizer:
+    """API 使用量の簡易最適化（時間帯でバッチサイズを調整）。"""
+
+    def __init__(self, daily_budget: int = 1500):
+        self.daily_budget = daily_budget
+        self.hourly_target = max(1, daily_budget // 24)
+
+    def get_optimal_batch_size(self, current_hour: Optional[int] = None) -> int:
+        from datetime import datetime as _dt
+        h = _dt.now().hour if current_hour is None else current_hour
+        if 0 <= h < 6:
+            return 1
+        elif 9 <= h < 18:
+            return 5
+        return 3
+
+
+class GeminiErrorDetector:
+    """Gemini 2.0 Flash によるエラー検出（APIキーがある場合のみ動作）。"""
+
+    def __init__(self, api_key: Optional[str]):
+        self.enabled = False
+        self.batch_size = 3
+        self.detection_queue: List[Dict[str, Any]] = []
+        self._model = None
+        try:
+            if api_key:
+                import google.generativeai as genai  # type: ignore
+                genai.configure(api_key=api_key)
+                self._model = genai.GenerativeModel("gemini-2.0-flash-exp")
+                self.enabled = True
+        except Exception:
+            # ライブラリ未導入やキー不在時は無効化
+            self.enabled = False
+            self._model = None
+
+    def add_entries(self, entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """エントリをキューに積み、バッチ到達時のみ処理して結果を返す。"""
+        if not entries:
+            return []
+        self.detection_queue.extend(entries)
+        if len(self.detection_queue) < self.batch_size:
+            return []
+        # 3件まとめて取り出し
+        batch = self.detection_queue[: self.batch_size]
+        self.detection_queue = self.detection_queue[self.batch_size :]
+        return self._process_batch(batch)
+
+    def _process_batch(self, batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """同期処理で簡易実装（UI応答性のため evaluate 側では非ブロッキングに扱う）。"""
+        try:
+            if not self.enabled or not self._model:
+                # 機能無効時は空で返す（介入なし）
+                return []
+            prompt = (
+                "以下の発話を同時に分析し、それぞれについて次を検出しJSONで返してください:\n"
+                "1) 事実誤認 2) 論理矛盾 3) ハルシネーション 4) 固有名詞の誤用\n"
+                "必ず次の形式で: {\"results\":[{\"id\":str,\"errors\":[{\"type\":str,\"detail\":str,\"entity\":str|null}]}]}\n\n"
+                + json.dumps(batch, ensure_ascii=False)
+            )
+            resp = self._model.generate_content(prompt)
+            text = getattr(resp, "text", None)
+            if isinstance(text, str) and text.strip():
+                return self._parse_batch_response(text)
+            # fallback: try to stringify response
+            try:
+                return self._parse_batch_response(str(resp))
+            except Exception:
+                return []
+        except Exception:
+            return []
+
+    def _parse_batch_response(self, s: str) -> List[Dict[str, Any]]:
+        """Gemini応答テキストから results 配列を抽出して返す。"""
+        try:
+            # JSON抽出（前後に説明文が混ざる可能性に対応）
+            ss = s.strip()
+            start = ss.find("{")
+            end = ss.rfind("}")
+            if start >= 0 and end > start:
+                ss = ss[start : end + 1]
+            data = json.loads(ss)
+            if isinstance(data, dict) and isinstance(data.get("results"), list):
+                return data["results"]  # type: ignore[return-value]
+        except Exception:
+            return []
+        return []
+
 
 class NaturalConversationDirector:
     """会話のテンポ/尺/相槌を制御するディレクター。内容判断を最小化。"""
 
-    def __init__(self, ollama_client=None, model_name: str = "qwen2.5:7b"):
-        self.client = ollama_client  # v2ではLLM依存を極小化(無くても動く)
+    def __init__(
+        self,
+        ollama_client=None,
+        model_name: str = "qwen2.5:7b",
+        gemini_api_key: Optional[str] = None,
+        use_mcp: bool = True,
+        local_model: Optional[str] = None,
+    ):
+        # LLM(任意)
+        self.client = ollama_client
         self.model_name = model_name
         self.temperature = 0.2
         self.current_phase = "flow"  # flow→wrap
         self.turn_counter = 0
 
-        # 検出した参加者名（会話ログの表示名）を A/B にマッピングするため保持
+        # 参加者名（表示名）-> A/B マッピング補助
         self.participants: List[str] = []  # [nameA, nameB]
 
         # メトリクス
-        self.metrics = {
+        self.metrics: Dict[str, Any] = {
             "avg_chars_last3": 0.0,
             "question_ratio": 0.0,
             "consecutive_by_last": 0,
-            "last_speaker": None,            # 表示名
-            "last_speaker_label": None,      # 'A' | 'B' | None
+            "last_speaker": None,
+            "last_speaker_label": None,
         }
 
-        # --- 介入拡張: 固有名詞チェックとSoft Ack（軽い受け流し）状態 ---
-        # Web検索（MCP）利用の有無（導入済み: Wikipedia RESTを用いた簡易検証）
-        self.use_mcp_search = True
-        self.mcp_adapter = MCPWebSearchAdapter(language="ja")
+        # v4: 監視/制限/費用最適化
+        self.rate_limiter = RateLimitManager()
+        self.cost_optimizer = CostOptimizer()
+        self.gemini_detector = GeminiErrorDetector(gemini_api_key)
 
-        # 指摘された側への「軽い受け流し」継続指示
+        # v4: MCP/検索
+        self.use_mcp_search = bool(use_mcp)
+        self.mcp_adapter = MCPWebSearchAdapter(language="ja") if self.use_mcp_search else None
+
+        # v4: エンティティ検証キャッシュ
+        self.entity_cache: Dict[str, Dict[str, Any]] = {}
+
+        # v4: LLMを使ったエンティティ抽出フォールバック（ヒューリスティクス既定OFF/LLM既定ON）
+        self.use_llm_entity_fallback = True
+        self.use_heuristics = bool(int(os.getenv("DIRECTOR_USE_HEURISTICS", "0")))  # 0=OFF(既定), 1=ON
+        self.always_llm_entity_scan = bool(int(os.getenv("DIRECTOR_ALWAYS_LLM_ENTITY_SCAN", "1")))  # 1=ON(既定)
+        self.entity_llm_model = local_model or self.model_name
+
+        # v4+: LLM主導の異常検出（ヒューリスティクスを最小化し、AIに「おかしなもの」を網羅抽出させる）
+        self.use_llm_anomaly_detector = True
+        self.max_anomaly_checks_per_turn = 4
+
+        # v4: Soft Ack 設定
         self.soft_ack_enabled = True
         self.soft_ack_max_reminders = 2
-        self.soft_ack_expire_window = 4  # 現在ターンからの有効ターン幅
+        self.soft_ack_expire_window = 4
+        self.pending_soft_ack: Dict[str, Dict[str, Any]] = {}
 
-        # セッション内キャッシュ/スケジューラ
-        self.entity_cache = {}  # name -> {verdict, evidence, evidence_text, ts}
-        self.pending_soft_ack = {}  # label('A'|'B')-> {remaining, expire_turn}
+        # 介入統計
+        self._intervention_stats: Dict[str, int] = {
+            "entity_checks": 0,
+            "entity_corrections": 0,
+            "soft_ack_dispatched": 0,
+            "gemini_batches": 0,
+            "rhythm_guides": 0,
+        }
 
-        # LLMベース抽出の利用設定
-        self.use_llm_entity_fallback = True
-        self.entity_llm_model = self.model_name
-        # ユーザー要望: アルゴ検出に頼らず LLM 抽出も常時併用する
-        self.always_llm_entity_scan = True
-        # ヒューリスティクス検出は無効化（LLM優先）
-        self.use_heuristics = False
+        # エンティティ検出の厳格度と1ターン上限
+        self.entity_detection_mode = "strict"  # strict | balanced
+        self.max_entity_checks_per_turn = 2
+        # LLM出力はJSONではなく文章を優先するか（環境変数で切替: 1/0）。既定ON
+        try:
+            self.prefer_text_llm_output = bool(int(os.getenv("DIRECTOR_PREFER_TEXT_LLM_OUTPUT", "1")))
+        except Exception:
+            self.prefer_text_llm_output = True
 
-    # ===== 公開API =====
     def plan_next_turn(self, dialogue_context: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """直近ログからテンポ指示JSONを生成する(LLM不要)。"""
-        self.turn_counter += 1
+        """リズム/長さ/話法のガイドを決める。"""
         stats = self._analyze(dialogue_context)
         speaker = self._pick_speaker(stats)
         speech_act = self._pick_speech_act(stats)
         max_chars = self._decide_max_chars(stats)
         aizuchi = self._decide_aizuchi(stats)
         closing_hint = self._decide_closing(stats)
-        # 禁止項目（会話汚染防止）
         ban_list = [
             "praise",
             "long_intro",
@@ -297,8 +448,10 @@ class NaturalConversationDirector:
                 return True
         return False
 
+    # 旧: イベント検出用ヘルパはLLM異常検出に統合したため削除
+
     # ===== 参考: 既存 evaluate_dialogue の互換API(機能拡張版) =====
-    async def evaluate_dialogue(self, dialogue_context: List[Dict[str, Any]]) -> Dict[str, Any]:
+    async def evaluate_dialogue(self, dialogue_context: List[Dict[str, Any]], mode: Optional[str] = None) -> Dict[str, Any]:
         """
         旧APIの互換インターフェース。
         優先度:
@@ -312,9 +465,13 @@ class NaturalConversationDirector:
         debug_info: Dict[str, Any] = {
             "heuristic_entities": [],
             "llm_entities": [],
-            "selected_candidate": None,
-            "verification": None,
+            "anomalies": [],
+            "all_candidates": [],
+            "verifications": [],
+            "gemini": None,
+            "holistic_text": None,
         }
+        mode = (mode or "balanced").lower()
 
         # 直近の非Director発話を取得
         last_entry = None
@@ -326,7 +483,45 @@ class NaturalConversationDirector:
         # 参加者A/Bの特定を更新（_analyzeはplan_next_turn内でも呼ばれているが安全のため）
         _ = self._analyze(dialogue_context)
 
-        # 1) 固有名詞チェック → 訂正促し（指摘するのは「発言者と別のAI」= 直近発話者の反対側）
+        # 0) 文章ベースのホリスティック評価（JSON出力を使わず、短い助言テキストを優先）
+        if last_entry and isinstance(last_entry.get("message"), str) and getattr(self, "prefer_text_llm_output", False):
+            offender_disp = last_entry.get("speaker") or ""
+            offender_label = self._label_of(offender_disp)
+            target_label = self._other(offender_label)
+            text0 = last_entry.get("message", "")
+            try:
+                htx = self._llm_holistic_review_text(text0, dialogue_context)
+            except Exception:
+                htx = None
+            if isinstance(htx, dict):
+                debug_info["holistic_text"] = htx.get("full_text")
+                if bool(htx.get("risk")):
+                    plan = self._build_holistic_intervention_text(target_label, htx)
+                    if self.soft_ack_enabled:
+                        self._schedule_soft_ack(offender_label)
+                        self._intervention_stats["soft_ack_dispatched"] += 1
+                    return {
+                        "intervention_needed": True,
+                        "reason": "holistic_text_review",
+                        "intervention_type": "challenge_and_verify",
+                        "message": json.dumps(plan, ensure_ascii=False),
+                        "response_length_guide": "簡潔",
+                        "confidence": 0.8,
+                        "director_debug": debug_info,
+                    }
+            # リスクがなければテンポ制御のみで返す（重い検出はスキップ）
+            self._intervention_stats["rhythm_guides"] += 1
+            return {
+                "intervention_needed": True,
+                "reason": "rhythm_control",
+                "intervention_type": "length_tempo_speech_act",
+                "message": json.dumps(cmd_rhythm, ensure_ascii=False),
+                "response_length_guide": "簡潔",
+                "confidence": 0.8,
+                "director_debug": debug_info,
+            }
+
+    # 1) 固有名詞チェック → 訂正促し（指摘するのは「発言者と別のAI」= 直近発話者の反対側）
         if last_entry and isinstance(last_entry.get("message"), str):
             offender_disp = last_entry.get("speaker") or ""
             offender_label = self._label_of(offender_disp)
@@ -335,7 +530,7 @@ class NaturalConversationDirector:
 
             # 1) ヒューリスティクス抽出（無効化設定ならスキップ）
             entities: List[Dict[str, Any]] = []
-            if getattr(self, "use_heuristics", True):
+            if getattr(self, "use_heuristics", False):
                 entities = self._extract_entities(text)
                 if entities:
                     logger.debug(f"Director entity candidates: {entities}")
@@ -360,91 +555,154 @@ class NaturalConversationDirector:
             # 3) 候補集合を決定（LLM優先。ヒューリスティクスは無効時は使わない）
             merged: List[Dict[str, Any]] = []
             seen = set()
-            for src in (llm_entities if not getattr(self, "use_heuristics", True) else (entities + llm_entities)):
+            for src in (llm_entities if not getattr(self, "use_heuristics", False) else (entities + llm_entities)):
                 n = src.get("name")
                 if n and n not in seen:
                     seen.add(n)
                     merged.append(src)
 
-            # 4) 候補選定: LLM抽出を優先（PERSON → その他未知語）。ヒューリスティクスは原則不使用
-            candidate = None
-            # 共通フィルタ: 一般語/略語を除外
-            def _passes(name: str) -> bool:
+            # 4) 候補選定（複数対応）: LLM抽出を優先（PERSON優先）。一般語は強く除外
+            selected: List[Dict[str, Any]] = []
+            # LLM異常検出（任意）
+            anomalies: List[Dict[str, Any]] = []
+            # 共通フィルタ
+            def _passes(name: str, etype: str) -> bool:
                 if not name:
                     return False
                 n = name.strip()
-                # 自他の呼称（参加者名やその敬称付き）は除外
                 if self._is_participant_name(n):
                     return False
                 if n in STOP_ENTITY_COMMON:
                     return False
-                # 2〜3文字の全大文字略語は除外（例: AI, IT, OS）
                 import re as _re
                 if _re.fullmatch(r"[A-Z]{1,3}", n):
                     return False
-                # 架空キャラクター/ニックネーム的な終端や表現は除外
                 if _re.search(r"(ちゃん|たん|っち|にゃん)$", n):
                     return False
-                # 明示的なフィクション/キャラ系キーワードを含む場合は除外
-                fiction_keywords = [
-                    "キャラ", "キャラクター", "VTuber", "ゆるキャラ", "マスコット", "アバター",
-                    "二次元", "三次元化", "推し", "擬人化",
-                ]
+                fiction_keywords = ["キャラ", "キャラクター", "VTuber", "ゆるキャラ", "マスコット", "アバター", "二次元", "三次元化", "推し", "擬人化"]
                 if any(kw in n for kw in fiction_keywords):
                     return False
-                # 英文氏名や複合語は許可
-                if " " in n:
+                # 厳格モード: PERSON 以外は明確な固有名手掛かりが無いと弾く
+                if (etype or "").upper() == "PERSON":
+                    # 英文名 or 漢字2文字以上の氏名想定
+                    if " " in n:
+                        return True
+                    if _re.search(r"[\u4E00-\u9FFF]", n) and len(n) >= 2:
+                        return True
+                    return False
+                # 非PERSONは以下の強いシグナルのいずれかが必要
+                # 1) 著名性ヒントが直近発話にある
+                if self._has_prominence_hint(text):
                     return True
-                # CJK名詞は2文字以上を許可、それ以外は3文字以上
-                if _re.search(r"[\u4E00-\u9FFF]", n):
-                    return len(n) >= 2
-                return len(n) >= 3
+                # 2) 組織/地名などの典型サフィックス
+                org_suffix = ["株式会社", "大学", "省", "庁", "市", "区", "県", "都", "府", "政府", "内閣", "党", "新聞", "テレビ", "放送", "病院", "研究所", "学会", "博物館", "神社", "寺", "駅"]
+                if any(n.endswith(suf) for suf in org_suffix):
+                    return True
+                # 3) 長めのカタカナ語（一般語を避けるため5文字以上）
+                if _re.fullmatch(r"[\u30A1-\u30F6\u30FC]{5,}", n):
+                    return True
+                # 4) 英数混在（製品名など）
+                if _re.search(r"[A-Za-z].*[0-9]|[0-9].*[A-Za-z]", n):
+                    return True
+                return False
 
+            # 4-a) AI主導の異常検出で「おかしなもの」を網羅抽出
+            pending_claims: List[Dict[str, Any]] = []
+            if self.use_llm_anomaly_detector and self.client is not None:
+                try:
+                    anomalies = self._llm_detect_anomalies(text) or []
+                    if anomalies:
+                        debug_info["anomalies"] = anomalies
+                        # 検証候補（PERSON/ORG/EVENT/ENTITY系）と、即時指摘（CLAIM系）に仕分け
+                        for a in anomalies:
+                            label = (a.get("label") or a.get("name") or "").strip()
+                            kind = str(a.get("kind") or a.get("type") or "OTHER").upper()
+                            reason = a.get("reason") or a.get("why") or None
+                            if not label:
+                                continue
+                            if kind == "CLAIM":
+                                pending_claims.append({
+                                    "name": label,
+                                    "type": "CLAIM",
+                                    "verdict": "AMBIGUOUS",
+                                    "evidence": None,
+                                    "evidence_text": reason,
+                                })
+                                continue
+                            mapped = "ENTITY"
+                            if kind in ("PERSON", "ORG", "EVENT"):
+                                mapped = kind
+                            # TERM/OTHERもENTITYとして扱う
+                            if all(c.get("name") != label for c in selected) and _passes(label, mapped):
+                                selected.append({"name": label, "type": mapped})
+                except Exception:
+                    pass
+
+            ordered_sources: List[Dict[str, Any]] = []
             if llm_entities:
-                # PERSON優先
-                for e in llm_entities:
-                    if (e.get("type") or "").upper() == "PERSON" and _passes((e.get("name") or "").strip()):
-                        candidate = e
-                        break
-                if not candidate:
-                    for e in llm_entities:
-                        n = (e.get("name") or "").strip()
-                        if _passes(n):
-                            candidate = e
-                            break
-                if not candidate:
-                    candidate = llm_entities[0]
-            if not candidate and merged and getattr(self, "use_heuristics", True):
+                ordered_sources.extend([e for e in llm_entities if (e.get("type") or "").upper() == "PERSON"])
+                ordered_sources.extend([e for e in llm_entities if (e.get("type") or "").upper() != "PERSON"])
+            elif merged:
+                ordered_sources = merged
+            for e in ordered_sources:
+                n = (e.get("name") or "").strip()
+                et = (e.get("type") or "ENTITY").upper()
+                if _passes(n, et):
+                    selected.append({"name": n, "type": et})
+            if getattr(self, "use_heuristics", False) and merged:
                 for e in merged:
-                    if (e.get("type") or "").upper() == "PERSON" and _passes((e.get("name") or "").strip()):
-                        candidate = e
-                        break
-                if not candidate:
-                    for e in merged:
-                        n = (e.get("name") or "").strip()
-                        if _passes(n):
-                            candidate = e
-                            break
-                if not candidate:
-                    candidate = merged[0]
+                    n = (e.get("name") or "").strip()
+                    et = (e.get("type") or "ENTITY").upper()
+                    if _passes(n, et) and all(c["name"] != n for c in selected):
+                        selected.append({"name": n, "type": et})
 
-            if candidate and candidate.get("name"):
-                name = candidate.get("name")
-                etype = candidate.get("type", "ENTITY")
-                debug_info["selected_candidate"] = {"name": name, "type": etype}
-                logger.info(f"MCP verify check target='{name}' type={etype}")
-                verdict = self._verify_entity(name, etype)
-                evidence = None
-                evidence_text = None
-                ec = self.entity_cache.get(name)
-                if isinstance(ec, dict):
-                    evidence = ec.get("evidence")
-                    evidence_text = ec.get("evidence_text")
-                debug_info["verification"] = {"verdict": verdict, "evidence": evidence, "evidence_text": evidence_text}
-                if verdict in ("AMBIGUOUS", "NG"):
-                    plan = self._build_entity_correction_plan(target_label, name)
+            # 1ターンの検証数を制限
+            if selected:
+                cap = max(self.max_entity_checks_per_turn, self.max_anomaly_checks_per_turn)
+                selected = selected[: cap]
+
+            if selected:
+                debug_info["all_candidates"] = list(selected)
+                verifications: List[Dict[str, Any]] = []
+                problem_names: List[str] = []
+                # 先にCLAIM系の擬似検証を反映（LLM理由を evidence_text に格納）
+                for pv in pending_claims:
+                    verifications.append(dict(pv))
+                    problem_names.append(pv.get("name"))
+                for c in selected:
+                    name = c.get("name")
+                    etype = c.get("type", "ENTITY")
+                    logger.info(f"MCP verify check target='{name}' type={etype}")
+                    verdict = self._verify_entity(name, etype)
+                    evidence = None
+                    evidence_text = None
+                    ec = self.entity_cache.get(name)
+                    if isinstance(ec, dict):
+                        evidence = ec.get("evidence")
+                        evidence_text = ec.get("evidence_text")
+                    vrow = {"name": name, "type": etype, "verdict": verdict, "evidence": evidence, "evidence_text": evidence_text}
+                    verifications.append(vrow)
+                    if verdict in ("AMBIGUOUS", "NG"):
+                        problem_names.append(name)
+                # 互換性のため、単一表示用の primary を設定
+                debug_info["verifications"] = verifications
+                if verifications:
+                    # 問題があればそれを、なければ先頭を primary に
+                    primary = next((v for v in verifications if v.get("verdict") in ("AMBIGUOUS", "NG")), verifications[0])
+                    debug_info["selected_candidate"] = {"name": primary.get("name"), "type": primary.get("type")}
+                    debug_info["verification"] = {
+                        "verdict": primary.get("verdict"),
+                        "evidence": primary.get("evidence"),
+                        "evidence_text": primary.get("evidence_text"),
+                    }
+
+                if problem_names:
+                    self._intervention_stats["entity_checks"] += len(selected)
+                    plan = self._build_entity_correction_plan(target_label, problem_names)
                     if self.soft_ack_enabled:
                         self._schedule_soft_ack(offender_label)
+                        self._intervention_stats["soft_ack_dispatched"] += 1
+                    self._intervention_stats["entity_corrections"] += 1
                     return {
                         "intervention_needed": True,
                         "reason": "entity_check",
@@ -454,6 +712,53 @@ class NaturalConversationDirector:
                         "confidence": 0.75,
                         "director_debug": debug_info,
                     }
+
+                # v4: バランス/徹底モードではGeminiバッチに投入（APIキーがあれば）
+                try:
+                    if self.gemini_detector and self.gemini_detector.enabled and mode in ("balanced", "thorough"):
+                        can_cloud, _ = self.rate_limiter.should_use_cloud()
+                        if can_cloud:
+                            batch_size = self.cost_optimizer.get_optimal_batch_size(None)
+                            self.gemini_detector.batch_size = max(1, batch_size)
+                            results = self.gemini_detector.add_entries([
+                                {
+                                    "id": f"turn-{self.turn_counter}",
+                                    "speaker": offender_disp,
+                                    "text": text,
+                                }
+                            ])
+                            if results:
+                                self._intervention_stats["gemini_batches"] += 1
+                                self.rate_limiter.note_call(1)
+                                debug_info["gemini"] = results
+                                # 直近エントリの結果を参照
+                                for r in results:
+                                    if r.get("id") == f"turn-{self.turn_counter}":
+                                        errs = r.get("errors") or []
+                                        # 固有名詞誤用などがあれば軽い指摘を優先
+                                        err_entity = None
+                                        for e in errs:
+                                            if (e.get("type") or "").lower() in ("entity", "named_entity", "proper_noun"):
+                                                err_entity = e.get("entity")
+                                                break
+                                        if errs:
+                                            entity_hint = err_entity if err_entity else "該当の名称"
+                                            plan = self._build_entity_correction_plan(target_label, entity_hint)
+                                            if self.soft_ack_enabled:
+                                                self._schedule_soft_ack(offender_label)
+                                                self._intervention_stats["soft_ack_dispatched"] += 1
+                                            self._intervention_stats["entity_corrections"] += 1
+                                            return {
+                                                "intervention_needed": True,
+                                                "reason": "gemini_error_detected",
+                                                "intervention_type": "entity_correction",
+                                                "message": json.dumps(plan, ensure_ascii=False),
+                                                "response_length_guide": "簡潔",
+                                                "confidence": 0.7,
+                                                "director_debug": debug_info,
+                                            }
+                except Exception:
+                    pass
 
         # 2) Soft Ack（軽い受け流し）配布（ターゲット= offender 本人）
         if self.soft_ack_enabled and self.pending_soft_ack:
@@ -484,6 +789,7 @@ class NaturalConversationDirector:
                     self.pending_soft_ack.pop(label, None)
 
         # 3) フォールバック: リズム/長さ/話法ガイド
+        self._intervention_stats["rhythm_guides"] += 1
         return {
             "intervention_needed": True,
             "reason": "rhythm_control",
@@ -493,6 +799,87 @@ class NaturalConversationDirector:
             "confidence": 0.8,
             "director_debug": debug_info,
         }
+
+    # ===== v4: 追加の公開ユーティリティ =====
+    def generate_length_instruction(self, guide_key: str) -> str:
+        """config/director_prompts.json の response_length_guidelines から指示文を取得。"""
+        try:
+            path_candidates = [
+                os.path.join(os.getcwd(), "config", "director_prompts.json"),
+                os.path.join(os.path.dirname(__file__), "..", "..", "config", "director_prompts.json"),
+            ]
+            cfg = None
+            for p in path_candidates:
+                try:
+                    if os.path.exists(p):
+                        with open(p, "r", encoding="utf-8") as f:
+                            cfg = json.load(f)
+                            break
+                except Exception:
+                    continue
+            if not isinstance(cfg, dict):
+                return "次は100-160文字、自然な会話文で簡潔に。"
+            g = (cfg.get("response_length_guidelines") or {}).get(guide_key) or {}
+            instr = g.get("instruction") or "100-160文字で、自然な会話文で。"
+            return str(instr)
+        except Exception:
+            return "100-160文字で、自然な会話文で。"
+
+    def should_end_dialogue(self, dialogue_history: List[Dict[str, Any]], turn_count: int) -> Tuple[bool, str]:
+        """終了判定（軽量ヒューリスティクス）。"""
+        # ターンが十分 & 質問比率が妥当なら終了提案
+        stats = self._analyze(dialogue_history)
+        if turn_count >= 18 and QUESTION_RATIO_TARGET[0] <= stats.get("question_ratio", 0.0) <= QUESTION_RATIO_TARGET[1]:
+            return True, "十分なターンと質疑の往復が成立したため"
+        if turn_count >= 22:
+            return True, "上限ターン到達"
+        return False, "継続"
+
+    def get_intervention_stats(self) -> Dict[str, Any]:
+        try:
+            return dict(self._intervention_stats)
+        except Exception:
+            return {}
+
+    def get_resource_usage(self) -> Dict[str, Any]:
+        """監視用の使用状況ダイジェスト（軽量）。"""
+        q = self.rate_limiter.get_current_usage() if hasattr(self, "rate_limiter") else {
+            "minute": {"used": 0, "limit": 0, "remaining": 0},
+            "daily": {"used": 0, "limit": 0, "remaining": 0},
+        }
+        return {
+            "performance": {
+                "avg_response_time": None,
+                "cache_hit_rate": None,
+                "error_detection_rate": None,
+            },
+            "resources": {
+                "vram_usage": None,  # 取得しない（外部依存回避）
+                "gemini_quota": f"{q['daily']['used']} / {q['daily']['limit']}" if q.get('daily') else None,
+                "mcp_calls": "unlimited" if self.use_mcp_search else "disabled",
+            },
+            "costs": {
+                "current_month": "$0",
+                "projected": "$0",
+            },
+        }
+
+    def degrade_gracefully(self, remaining_quota: int) -> Dict[str, Any]:
+        """残量に応じた機能制限ポリシー（参考実装）。"""
+        if remaining_quota > 500:
+            return {"all_features": True}
+        elif remaining_quota > 100:
+            return {
+                "entity_check": True,
+                "fact_check": False,
+                "contradiction": True,
+            }
+        else:
+            return {
+                "entity_check": True,
+                "fact_check": False,
+                "contradiction": False,
+            }
 
     # ===== 固有名詞チェック/Soft Ack 補助 =====
     def _extract_entities(self, text: str) -> List[Dict[str, str]]:
@@ -504,6 +891,11 @@ class NaturalConversationDirector:
         """
         results: List[Dict[str, str]] = []
         try:
+            # 先にイベント句（例: 本能寺の変 等）を優先抽出
+            for m in re.finditer(r"([\u4E00-\u9FFF]{2,10}の(?:変|乱|戦い|戦争|合戦)|[\u4E00-\u9FFF]{2,10}(?:事件|騒動|大戦|虐殺|蜂起|暴動|革命))", text):
+                cand = m.group(0).strip()
+                if cand:
+                    results.append({"name": cand, "type": "EVENT"})
             # 英文氏名っぽい
             for m in re.finditer(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b", text):
                 cand = m.group(1).strip()
@@ -545,7 +937,7 @@ class NaturalConversationDirector:
             if key and key not in seen:
                 seen.add(key)
                 unique.append(r)
-        return unique[:3]
+        return unique[:5]
 
     def _has_prominence_hint(self, text: str) -> bool:
         """著名性や役職を示すヒント語が含まれるかの簡易判定。"""
@@ -641,6 +1033,55 @@ class NaturalConversationDirector:
             return None
         return None
 
+    def _llm_detect_anomalies(self, text: str) -> Optional[List[Dict[str, Any]]]:
+        """LLMに『おかしなもの（誤用/曖昧/疑わしい主張/架空名等）』の網羅抽出を依頼し、
+        次のJSON形式で返す: {"anomalies":[{"label":str,"kind":"PERSON|ORG|EVENT|ENTITY|CLAIM|OTHER","reason":str}...]}
+        最小限の実装として、Ollama互換のchat APIにプロンプトしてJSON抽出する。
+        """
+        if not self.client:
+            return None
+        try:
+            system = (
+                "あなたは会話監督の補助です。以下の日本語発話から、内容面で『おかしなもの』を網羅抽出してください。"
+                "対象例: 架空/誤用の可能性がある固有名詞、曖昧な主張(年代・場所・出来事が不明確)、不自然な専門用語の組み合わせなど。"
+                "出力はJSONのみ。各項目は label(短い名称), kind(PERSON/ORG/EVENT/ENTITY/CLAIM/OTHER), reason(一言理由) を含めてください。"
+                "説明文や前置きは不要です。"
+            )
+            user = (
+                "発話:\n" + text + "\n\n"
+                "JSONのみを出力:\n{\n  \"anomalies\": [ {\"label\": string, \"kind\": \"PERSON|ORG|EVENT|ENTITY|CLAIM|OTHER\", \"reason\": string} ]\n}"
+            )
+            resp = self.client.chat(
+                model=self.entity_llm_model,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                options={"temperature": 0.1},
+                stream=False,
+            )
+            content = (resp.get("message") or {}).get("content")
+            if not content:
+                return None
+            s = str(content).strip()
+            a = s.find("{")
+            b = s.rfind("}")
+            if a >= 0 and b > a:
+                s = s[a:b+1]
+            data = json.loads(s)
+            arr = (data or {}).get("anomalies")
+            if isinstance(arr, list):
+                out: List[Dict[str, Any]] = []
+                for it in arr:
+                    if not isinstance(it, dict):
+                        continue
+                    label = (it.get("label") or it.get("name") or "").strip()
+                    kind = str(it.get("kind") or it.get("type") or "OTHER").upper()
+                    reason = (it.get("reason") or it.get("why") or "").strip()
+                    if label:
+                        out.append({"label": label, "kind": kind, "reason": reason})
+                return out
+        except Exception:
+            return None
+        return None
+
     def _schedule_soft_ack(self, offender_label: str) -> None:
         remaining = self.soft_ack_max_reminders
         expire = self.turn_counter + self.soft_ack_expire_window
@@ -651,10 +1092,24 @@ class NaturalConversationDirector:
             expire = max(prev.get("expire_turn", 0), expire)
         self.pending_soft_ack[offender_label] = {"remaining": remaining, "expire_turn": expire}
 
-    def _build_entity_correction_plan(self, target_label: str, entity_name: str) -> Dict[str, Any]:
-        """指摘する側（発言者の反対側）向けの短い指摘スタイル計画を返す。"""
-        # 軽い相づち例に「指摘のニュアンス」を埋め込む（UI側で例が表示される）
-        example = f"『{entity_name}』は確認が必要かも"
+    def _build_entity_correction_plan(self, target_label: str, entity_name_or_list: Any) -> Dict[str, Any]:
+        """指摘する側（発言者の反対側）向けの短い指摘スタイル計画を返す。
+        entity_name_or_list: str | List[str]
+        複数名のときは1つの相づちにまとめて簡潔に触れる。
+        """
+        if isinstance(entity_name_or_list, list):
+            names = [str(n) for n in entity_name_or_list if str(n).strip()]
+            if not names:
+                names = ["いくつかの名前"]
+            if len(names) == 1:
+                mention = f"『{names[0]}』"
+            elif len(names) == 2:
+                mention = f"『{names[0]}』『{names[1]}』"
+            else:
+                mention = f"『{names[0]}』ほか"
+        else:
+            mention = f"『{str(entity_name_or_list)}』"
+        example = f"{mention}は確認が必要かも"
         plan = {
             "turn_style": {
                 "speaker": target_label,
@@ -685,6 +1140,88 @@ class NaturalConversationDirector:
             "cadence": {"avoid_consecutive_monologues": True},
             "closing_hint": "続ける",
         }
+        return plan
+
+    # ===== Holistic(文章) レビュー =====
+    def _llm_holistic_review_text(self, text: str, context: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """直近発話の整合性・曖昧さ・危うさを文章で簡潔にレビューしてもらう。
+        出力はJSONに依存せず、内部用に辞書へ整形して返す（full_textはそのままUI表示可）。
+        戻り値例: {"full_text": str, "risk": bool, "risk_level": "low|med|high", "suggestions": [str], "queries": [str]}
+        """
+        if not self.client:
+            return None
+        try:
+            theme = None
+            try:
+                # コンテキスト先頭のテーマを拾う（なければNone）
+                for m in context:
+                    if m.get("role") == "system" and "テーマ" in (m.get("message") or ""):
+                        theme = m.get("message")
+                        break
+            except Exception:
+                pass
+            sys_prompt = (
+                "あなたは対話ディレクターのレビュアです。以下の日本語発話について、意味の通りに簡潔にレビューし、"
+                "曖昧・誤認・場所や時代の取り違え・ありえない主張がないかを人間にわかる文章で短く指摘してください。"
+                "次の点を含め、箇条書きではなく2-4文の簡潔な日本語で:")
+            if theme:
+                sys_prompt += f"\n会話のテーマ参考: {theme}\n"
+            user_prompt = (
+                "発話:\n" + text + "\n\n"
+                "出力要件: JSON禁止。丁寧語は避け、端的な助言調で。\n"
+                "1) まずおかしさがあれば具体的に指摘し、なければ『特に不自然ではない』と述べる。\n"
+                "2) 必要なら1つだけ確認質問や検索キーワード案を添える（任意）。")
+            resp = self.client.chat(
+                model=self.entity_llm_model,
+                messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}],
+                options={"temperature": 0.2},
+                stream=False,
+            )
+            content = (resp.get("message") or {}).get("content")
+            if not content:
+                return None
+            full = str(content).strip()
+            # リスク推定（簡易）
+            risk = any(k in full for k in ["矛盾", "誤り", "誤認", "曖昧", "不自然", "怪しい", "根拠", "ありえない", "辻褄"])
+            level = "med" if risk else "low"
+            # 追跡クエリ抽出（末尾の疑問文や『〜で検索』等を拾う簡易処理）
+            queries: List[str] = []
+            try:
+                for m in re.finditer(r"[『\"]([^『\"]{4,40})[』\"][でを]?検索", full):
+                    queries.append(m.group(1))
+            except Exception:
+                pass
+            suggs: List[str] = []
+            # 先頭文をそのまま suggestion にも使う
+            first_sent = re.split(r"[。.!?！？]", full)[0].strip()
+            if first_sent:
+                suggs.append(first_sent)
+            return {"full_text": full, "risk": bool(risk), "risk_level": level, "suggestions": suggs, "queries": queries}
+        except Exception:
+            return None
+
+    def _build_holistic_intervention_text(self, target_label: str, review: Dict[str, Any]) -> Dict[str, Any]:
+        """ホリスティックレビュー結果をもとに、短い『ツッコミ+確認』の発話計画を生成。"""
+        tip = (review.get("suggestions") or ["それ、確認したいかも"][0]) if review else "それ、確認したいかも"
+        q = None
+        if review and isinstance(review.get("queries"), list) and review["queries"]:
+            q = review["queries"][0]
+        aizuchi_list = [tip] if tip else ["それ、確認したいかも"]
+        plan = {
+            "turn_style": {
+                "speaker": target_label,
+                "length": {"max_chars": 85, "max_sentences": 2},
+                "preface": {"aizuchi": True, "aizuchi_list": aizuchi_list, "prob": 1.0},
+                "speech_act": "disagree_short",
+                "follow_up": "ask_feel",
+                "ban": ["praise", "list_format", "long_intro"],
+            },
+            "cadence": {"avoid_consecutive_monologues": True},
+            "closing_hint": "続ける",
+        }
+        # 補助: 検索キーワードの示唆を director_debug にも載せる想定だが、ここではplanに含めず最低限
+        if q:
+            plan["note"] = {"query_suggest": q}
         return plan
 
     # ===== Judgeユーティリティ(任意) =====

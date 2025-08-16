@@ -230,19 +230,26 @@ class Agent:
             prompt_parts.append(f"\n【アドバイス】")
             prompt_parts.append(director_instruction)
 
-        # Directorの検出/検証補足があれば追加（1ターンのみ有効）
-        if isinstance(director_findings, dict) and director_findings.get('entity_name'):
-            en = director_findings.get('entity_name')
-            vd = director_findings.get('verdict') or 'AMBIGUOUS'
-            ev = director_findings.get('evidence')
-            ex = director_findings.get('evidence_excerpt')
-            prompt_parts.append("\n【検証補足（Director）】")
-            prompt_parts.append(f"対象: 『{en}』 / 判定: {vd}")
-            if ev:
-                prompt_parts.append(f"根拠URL: {ev}")
-            if ex:
-                prompt_parts.append("根拠要約: " + ex)
-            prompt_parts.append("必要に応じてこの情報をやわらかく活用してください（確認・補足など）。")
+        # Directorの検出/検証/レビュー補足があれば追加（1ターンのみ有効）
+        if isinstance(director_findings, dict):
+            # エンティティ検証
+            if director_findings.get('entity_name'):
+                en = director_findings.get('entity_name')
+                vd = director_findings.get('verdict') or 'AMBIGUOUS'
+                ev = director_findings.get('evidence')
+                ex = director_findings.get('evidence_excerpt')
+                prompt_parts.append("\n【検証補足（Director）】")
+                prompt_parts.append(f"対象: 『{en}』 / 判定: {vd}")
+                if ev:
+                    prompt_parts.append(f"根拠URL: {ev}")
+                if ex:
+                    prompt_parts.append("根拠要約: " + ex)
+                prompt_parts.append("必要に応じてこの情報をやわらかく活用してください（確認・補足など）。")
+            # ホリスティックレビュー（文章）
+            if director_findings.get('holistic_text'):
+                prompt_parts.append("\n【レビュー補足（Director）】")
+                prompt_parts.append(str(director_findings.get('holistic_text')))
+                prompt_parts.append("上の指摘や違和感を、穏やかに一言で確かめる/ツッコむ材料として活用しても構いません。")
         
         # 最新のDirective（長さ指示を含む）
         if self.turn_directives:
