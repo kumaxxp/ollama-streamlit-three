@@ -327,6 +327,10 @@ with dialogue_container:
                         if dbg.get("holistic_text"):
                             st.caption("🧠 ホリスティックレビュー(テキスト)")
                             st.write(dbg.get("holistic_text"))
+                        # 2回目の再レビュー情報（存在すれば）
+                        if isinstance(entry.get("content"), str) and 'challenge_and_verify' in str(entry.get("content")):
+                            st.caption("🧠 再レビュー(証拠取り込み)")
+                            st.write("証拠を取り込んだ再レビューが実行され、pushbackや指示が強化されています。")
                     with colR:
                         st.caption("✅ 候補と検証")
                         st.code(json.dumps({
@@ -335,6 +339,58 @@ with dialogue_container:
                             "all_candidates": dbg.get("all_candidates"),
                             "verifications": dbg.get("verifications"),
                         }, ensure_ascii=False, indent=2))
+                        # 追加: Web検索の可視化（MCP/Wikipedia）
+                        try:
+                            has_search = bool(dbg.get("research") or dbg.get("wiki_snippets"))
+                        except Exception:
+                            has_search = False
+                        if has_search:
+                            st.caption("🌐 Web検索ログ（Director実行）")
+                            # 1) その場検索 research（単発）
+                            if isinstance(dbg.get("research"), list) and dbg.get("research"):
+                                st.markdown("- その場検証（キーワード指定）")
+                                try:
+                                    for r in dbg.get("research")[:3]:
+                                        if isinstance(r, dict):
+                                            q = r.get("query")
+                                            v = r.get("verdict")
+                                            u = r.get("evidence")
+                                            ex = r.get("evidence_text")
+                                            st.write(f"• 検索: {q} / 判定: {v}")
+                                            if u:
+                                                st.write(f"  URL: {u}")
+                                            if ex:
+                                                st.write("  要約: " + str(ex)[:240])
+                                except Exception:
+                                    pass
+                            # 2) Wikipediaスニペット（複数候補）
+                            if isinstance(dbg.get("wiki_snippets"), list) and dbg.get("wiki_snippets"):
+                                st.markdown("- Wikipediaスニペット")
+                                try:
+                                    for s in dbg.get("wiki_snippets")[:4]:
+                                        if isinstance(s, dict):
+                                            q = s.get("query")
+                                            t = s.get("title")
+                                            u = s.get("url")
+                                            ex = s.get("excerpt")
+                                            header = f"• 検索: {q} → 候補: {t}" if q else f"• 候補: {t}"
+                                            st.write(header)
+                                            if ex:
+                                                st.write("  要約: " + str(ex)[:240])
+                                            if u:
+                                                st.write(f"  URL: {u}")
+                                except Exception:
+                                    pass
+                        # 3) 地理や作品検証の補助情報
+                        try:
+                            if isinstance(dbg.get("geo"), dict) and dbg.get("geo"):
+                                st.caption("🗺️ 地理チェック")
+                                st.code(json.dumps(dbg.get("geo"), ensure_ascii=False, indent=2))
+                            if isinstance(dbg.get("works_detected"), list) and dbg.get("works_detected"):
+                                st.caption("📚 作品検証")
+                                st.code(json.dumps(dbg.get("works_detected"), ensure_ascii=False, indent=2))
+                        except Exception:
+                            pass
         elif entry["type"] == "director_analysis_event":
             # 任意のタイミングでのDirector分析スナップショット
             if show_analysis:

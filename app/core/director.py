@@ -530,8 +530,45 @@ class NaturalConversationDirector:
                     # 追加: 作品名の簡易検出（引用過多の抑制や要旨確認の誘導）
                     try:
                         works = self._detect_classics_and_works(text0) or []
+                        # 追加: ホリスティックレビュー本文内の「…」/『…』も検索対象へ
+                        try:
+                            rtxt = (htx.get("full_text") or "") if isinstance(htx, dict) else ""
+                            if rtxt:
+                                import re as _re
+                                for m in _re.finditer(r"[「『]([^」』]{2,20})[」』]", rtxt):
+                                    t = (m.group(1) or "").strip()
+                                    if t and t not in works:
+                                        works.append(t)
+                        except Exception:
+                            pass
                     except Exception:
                         works = []
+                    # 作品タイトル（複数）と、レビュー内の任意クエリでWikipediaスニペット検索
+                    try:
+                        wiki_snippets = []
+                        if self.use_mcp_search and self.mcp_adapter:
+                            # まず作品タイトルそれぞれで検索
+                            for w in works[:3]:
+                                snips = self.mcp_adapter.search_snippets(w, limit=2) or []
+                                for s in snips:
+                                    s_row = {"query": w, "title": s.get("title"), "url": s.get("url"), "excerpt": s.get("excerpt")}
+                                    wiki_snippets.append(s_row)
+                            # 追加: レビューが示唆する queries でも1本だけ検索
+                            q_extra = None
+                            try:
+                                qlist = htx.get("queries") or []
+                                if isinstance(qlist, list) and qlist:
+                                    q_extra = str(qlist[0])
+                            except Exception:
+                                q_extra = None
+                            if q_extra and not works:
+                                snips2 = self.mcp_adapter.search_snippets(q_extra, limit=2) or []
+                                for s in snips2:
+                                    wiki_snippets.append({"query": q_extra, "title": s.get("title"), "url": s.get("url"), "excerpt": s.get("excerpt")})
+                        if wiki_snippets:
+                            debug_info["wiki_snippets"] = wiki_snippets[:4]
+                    except Exception:
+                        pass
                     # Agent向け短期ディレクティブを生成（2ターン有効）
                     review_directives = {
                         "required_actions": [],
@@ -551,8 +588,52 @@ class NaturalConversationDirector:
                     if works:
                         review_directives["required_actions"].append("summarize_work")
                         review_directives["avoid"].append("overuse_classics")
-                        debug_info["works_detected"] = works
+                        debug_info["works_detected"] = []
+                        # 各作品を即時に検証し、存在しない/曖昧は NG/AMBIGUOUS として注記
+                        for w in works[:3]:
+                            try:
+                                row = self._summarize_or_validate_work(w)
+                            except Exception:
+                                row = {"title": w, "verdict": "AMBIGUOUS", "url": None, "summary": None}
+                            debug_info["works_detected"].append(row)
+                            if row.get("verdict") in ("NG", "AMBIGUOUS"):
+                                # NG/曖昧なら、誤記/架空の可能性を短く確認する行動を促す
+                                if "offer_correction" not in review_directives["required_actions"]:
+                                    review_directives["required_actions"].append("offer_correction")
+                    # 1回目のプラン
                     plan = self._build_holistic_intervention_text(target_label, htx)
+                    # 証拠(wiki_snippets)があるなら、2回目のホリスティック再レビューで指示を強化
+                    try:
+                        wiki_snips = debug_info.get("wiki_snippets") or []
+                        if wiki_snips:
+                            second = self._llm_holistic_review_with_evidence(text0, wiki_snips[:3])
+                            if isinstance(second, dict):
+                                # pushback の上書き(あれば)
+                                pb = (second.get("pushback") or "").strip()
+                                if pb:
+                                    # planの相槌を差し替え
+                                    try:
+                                        plan_ts = plan.get("turn_style", {})
+                                        pre = plan_ts.get("preface", {})
+                                        pre["aizuchi_list"] = [self.auto_repair(pb, max_chars=70)]
+                                        pre["aizuchi"] = True
+                                        plan_ts["preface"] = pre
+                                        plan["turn_style"] = plan_ts
+                                    except Exception:
+                                        pass
+                                # agent_directives の取り込み（元の review_directives とマージ）
+                                ad = second.get("agent_directives") or {}
+                                if isinstance(ad, dict):
+                                    for key in ("required_actions", "ensure", "avoid"):
+                                        if isinstance(ad.get(key), list):
+                                            review_directives.setdefault(key, [])
+                                            for v in ad[key]:
+                                                if v not in review_directives[key]:
+                                                    review_directives[key].append(v)
+                                    if isinstance(ad.get("tone_hint"), str):
+                                        review_directives["tone_hint"] = ad.get("tone_hint")
+                    except Exception:
+                        pass
                     if self.soft_ack_enabled:
                         self._schedule_soft_ack(offender_label)
                         self._intervention_stats["soft_ack_dispatched"] += 1
@@ -567,6 +648,70 @@ class NaturalConversationDirector:
                         "review_directives": review_directives,
                     }
             # リスクがなければテンポ制御のみで返す（重い検出はスキップ）
+            # ただし、かっこ内の引用（作品/言い回し）がある場合は最低限の検証を実施し、NG/曖昧なら短くツッコむ
+            try:
+                works = self._detect_classics_and_works(text0) or []
+                # 追加: ホリスティックレビュー本文内の「…」/『…』も検索対象へ
+                try:
+                    rtxt = (htx.get("full_text") or "") if isinstance(htx, dict) else ""
+                    if rtxt:
+                        import re as _re
+                        for m in _re.finditer(r"[「『]([^」』]{2,20})[」』]", rtxt):
+                            t = (m.group(1) or "").strip()
+                            if t and t not in works:
+                                works.append(t)
+                except Exception:
+                    pass
+            except Exception:
+                works = []
+            if works and self.use_mcp_search and self.mcp_adapter:
+                try:
+                    debug_info.setdefault("works_detected", [])
+                    # まずスニペット検索（ログ用）
+                    try:
+                        wiki_snips = []
+                        for w in works[:3]:
+                            sn = self.mcp_adapter.search_snippets(w, limit=2) or []
+                            for s in sn:
+                                wiki_snips.append({"query": w, "title": s.get("title"), "url": s.get("url"), "excerpt": s.get("excerpt")})
+                        if wiki_snips:
+                            debug_info["wiki_snippets"] = wiki_snips[:4]
+                    except Exception:
+                        pass
+                    # 判定
+                    flagged = False
+                    for w in works[:3]:
+                        row = self._summarize_or_validate_work(w)
+                        debug_info["works_detected"].append(row)
+                        if row.get("verdict") in ("NG", "AMBIGUOUS"):
+                            flagged = True
+                    if flagged:
+                        target_label = self._other(self._label_of(offender_disp))
+                        # 短いツッコミを促すディレクティブ
+                        review_directives = {
+                            "required_actions": ["offer_correction", "one_concise_question"],
+                            "avoid": ["praise", "list_format", "overuse_classics"],
+                            "tone_hint": "端的/助言調",
+                            "ttl_turns": 2,
+                        }
+                        pb = "そんな言葉ないですよ。別の表現のこと？"
+                        plan = self._build_pushback_plan(target_label, pb)
+                        if self.soft_ack_enabled:
+                            self._schedule_soft_ack(self._label_of(offender_disp))
+                            self._intervention_stats["soft_ack_dispatched"] += 1
+                        return {
+                            "intervention_needed": True,
+                            "reason": "quoted_phrase_unverified",
+                            "intervention_type": "entity_correction",
+                            "message": json.dumps(plan, ensure_ascii=False),
+                            "response_length_guide": "簡潔",
+                            "confidence": 0.75,
+                            "director_debug": debug_info,
+                            "review_directives": review_directives,
+                        }
+                except Exception:
+                    pass
+            # 引用もなく完全に安全→テンポ制御のみ
             self._intervention_stats["rhythm_guides"] += 1
             return {
                 "intervention_needed": True,
@@ -1158,10 +1303,71 @@ class NaturalConversationDirector:
             return None
         return None
 
+    def _llm_holistic_review_with_evidence(self, text: str, evidence: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Wikipedia等のスニペット(タイトル/URL/要約)を添えて、再度ホリスティックレビューを実行。
+        期待出力(JSON):
+        {
+          "issues": [{"type":"fact|logic|entity|geo|style", "message": str}],
+          "pushback": str,
+          "agent_directives": {
+             "required_actions": [str...],
+             "ensure": [str...],
+             "avoid": [str...],
+             "tone_hint": str
+          }
+        }
+        """
+        if not self.client or not evidence:
+            return None
+        try:
+            # 証拠を短く整形
+            lines = []
+            for i, ev in enumerate(evidence[:3], 1):
+                t = (ev.get("title") or "").strip()
+                u = (ev.get("url") or "").strip()
+                ex = (ev.get("excerpt") or "").strip()
+                if t or u or ex:
+                    ex_short = ex.replace("\n", " ")[:240]
+                    lines.append(f"[{i}] {t} | {u} | {ex_short}")
+            ev_text = "\n".join(lines)
+
+            system = (
+                "あなたは対話監督のレビュアです。以下の発話と参考情報(要約/URL)を踏まえて、\n"
+                "おかしさの指摘・短いツッコミ(pushback)・次ターン用の行動指示(agent_directives)をJSONで返してください。\n"
+                "行動指示は『1つだけ短い質問』『可能ならURLを1つだけ』『誤記疑いならやわらかく確認』『引用控えめ』などを含めてください。"
+            )
+            user = (
+                "発話:\n" + text + "\n\n"
+                "参考情報(上位):\n" + ev_text + "\n\n"
+                "JSONのみで出力:\n"
+                "{\n  \"issues\": [{\"type\": \"fact|logic|entity|geo|style\", \"message\": string}],\n"
+                "  \"pushback\": string,\n  \"agent_directives\": {\n"
+                "    \"required_actions\": [string], \"ensure\": [string], \"avoid\": [string], \"tone_hint\": string\n  }\n}"
+            )
+            resp = self.client.chat(
+                model=self.entity_llm_model,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                options={"temperature": 0.1},
+                stream=False,
+            )
+            content = (resp.get("message") or {}).get("content")
+            if not content:
+                return None
+            s = str(content).strip()
+            a = s.find("{"); b = s.rfind("}")
+            if a >= 0 and b > a:
+                s = s[a:b+1]
+            data = json.loads(s)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            return None
+        return None
+
     def _detect_classics_and_works(self, text: str) -> List[str]:
         """古典・作品名っぽい語を簡易検出（例: 源氏物語/枕草子/徒然草/論語/平家物語 など）。"""
         try:
-            cand = []
+            cand: List[str] = []
             # 代表的パターン: 〜物語/〜草子/〜集/〜記/論語 ほか
             pats = [
                 r"[\u4E00-\u9FFF]{1,6}物語",
@@ -1176,6 +1382,15 @@ class NaturalConversationDirector:
                     w = m.group(0)
                     if w and w not in cand:
                         cand.append(w)
+            # かっこ内の引用タイトルを追加検出（「…」/『…』）
+            try:
+                for m in _re.finditer(r"[「『]([^」』]{2,20})[」』]", text):
+                    t = (m.group(1) or "").strip()
+                    # 記号だらけ/短すぎ/長すぎを除外
+                    if t and 2 <= len(t) <= 20:
+                        cand.append(t)
+            except Exception:
+                pass
             # 既知語の典型例を優先
             known = ["源氏物語", "枕草子", "徒然草", "平家物語", "論語"]
             for k in known:

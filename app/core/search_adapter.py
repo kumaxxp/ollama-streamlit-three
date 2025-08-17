@@ -146,3 +146,36 @@ class MCPWebSearchAdapter:
                 return (float(lat), float(lon), bool(in_japan))
         except Exception:
             return (None, None, None)
+
+    def search_snippets(self, query: str, limit: int = 3):
+        """Wikipedia検索で上位のタイトルを取得し、それぞれの要約を返す。
+        Returns: [{title, url, excerpt}] 最大 limit 件。失敗時は空配列。
+        """
+        if not httpx:
+            return []
+        q = (query or "").strip()
+        if not q:
+            return []
+        base = f"https://{self.lang}.wikipedia.org"
+        # page 検索API（v1/search/page）で幅広に拾う
+        search_url = f"{base}/w/rest.php/v1/search/page?q={httpx.QueryParams({'q': q, 'limit': limit})['q']}&limit={int(limit)}"
+        out = []
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                r = client.get(search_url, headers={"accept": "application/json"})
+                if r.status_code != 200:
+                    return []
+                data = r.json()
+                pages = (data or {}).get("pages") or []
+                for p in pages[:limit]:
+                    title = (p.get("title") or "").strip()
+                    if not title:
+                        continue
+                    s_url = f"{base}/api/rest_v1/page/summary/{httpx.URL(title).raw_path.decode('utf-8')}"
+                    v, u, ex = self._fetch_summary_with_text(s_url)
+                    # v は使わず、タイトル・URL・要約を提示
+                    if u or ex:
+                        out.append({"title": title, "url": u, "excerpt": ex})
+            return out
+        except Exception:
+            return []

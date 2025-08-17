@@ -250,6 +250,47 @@ class Agent:
                 prompt_parts.append("\n【レビュー補足（Director）】")
                 prompt_parts.append(str(director_findings.get('holistic_text')))
                 prompt_parts.append("上の指摘や違和感を、穏やかに一言で確かめる/ツッコむ材料として活用しても構いません。")
+            # 作品検証があれば提示
+            if director_findings.get('works_detected'):
+                ws = director_findings.get('works_detected')
+                try:
+                    if isinstance(ws, list) and ws:
+                        prompt_parts.append("\n【作品検証（Director）】")
+                        for item in ws[:2]:
+                            if isinstance(item, dict):
+                                t = item.get('title')
+                                v = item.get('verdict')
+                                u = item.get('url')
+                                if t and v:
+                                    line = f"『{t}』: 判定 {v}"
+                                    if u:
+                                        line += f" / URL: {u}"
+                                    prompt_parts.append(line)
+                        prompt_parts.append("存在が曖昧/NGのものは、誤記や架空の可能性を短く確認してから話を進めてください。")
+                except Exception:
+                    pass
+            # Wikipediaスニペット（必要ならURLを1つだけ）
+            if director_findings.get('wiki_snippets'):
+                sn = director_findings.get('wiki_snippets')
+                try:
+                    if isinstance(sn, list) and sn:
+                        prompt_parts.append("\n【参考（Wikipedia検索）】")
+                        s0 = sn[0]
+                        if isinstance(s0, dict):
+                            q = s0.get('query')
+                            t = s0.get('title')
+                            u = s0.get('url')
+                            ex = s0.get('excerpt')
+                            if q:
+                                prompt_parts.append(f"検索: {q}")
+                            if t:
+                                prompt_parts.append(f"候補: {t}")
+                            if ex:
+                                prompt_parts.append("要約: " + str(ex)[:200])
+                            if u:
+                                prompt_parts.append(f"URL: {u}")
+                except Exception:
+                    pass
             # Review directives の短い実行ブロック
             if director_findings.get('review_block'):
                 prompt_parts.append("\n【From Director Review】")

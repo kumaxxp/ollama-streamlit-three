@@ -333,6 +333,15 @@ class DialogueController:
                     "evidence": r0.get("evidence"),
                     "evidence_excerpt": (r0.get("evidence_text") or "")[:280]
                 }
+            # 作品検証の結果（あればそのまま渡す）
+            works = dbg.get("works_detected")
+            if isinstance(works, list) and works:
+                findings["works_detected"] = works
+            # Wikipediaスニペット（簡易検索結果）
+            wiki_snips = dbg.get("wiki_snippets")
+            if isinstance(wiki_snips, list) and wiki_snips:
+                # 多すぎると冗長なので2件に絞る
+                findings["wiki_snippets"] = wiki_snips[:2]
 
             # 何かしらあれば保存
             if len(findings) > 1:  # timestamp 以外がある
