@@ -194,10 +194,10 @@ class NaturalConversationDirector:
         self.turn_counter = 0
 
         # 参加者名（表示名）-> A/B マッピング補助
-        self.participants: List[str] = []  # [nameA, nameB]
+        self.participants = []  # [nameA, nameB]
 
         # メトリクス
-        self.metrics: Dict[str, Any] = {
+        self.metrics = {
             "avg_chars_last3": 0.0,
             "question_ratio": 0.0,
             "consecutive_by_last": 0,
@@ -215,7 +215,9 @@ class NaturalConversationDirector:
         self.mcp_adapter = MCPWebSearchAdapter(language="ja") if self.use_mcp_search else None
 
         # v4: エンティティ検証キャッシュ
-        self.entity_cache: Dict[str, Dict[str, Any]] = {}
+        self.entity_cache = {}
+        # 共有知識キャッシュ（作品・古典など）
+        self.shared_knowledge_cache = {}
 
         # v4: LLMを使ったエンティティ抽出フォールバック（ヒューリスティクス既定OFF/LLM既定ON）
         self.use_llm_entity_fallback = True
@@ -231,10 +233,10 @@ class NaturalConversationDirector:
         self.soft_ack_enabled = True
         self.soft_ack_max_reminders = 2
         self.soft_ack_expire_window = 4
-        self.pending_soft_ack: Dict[str, Dict[str, Any]] = {}
+        self.pending_soft_ack = {}
 
         # 介入統計
-        self._intervention_stats: Dict[str, int] = {
+        self._intervention_stats = {
             "entity_checks": 0,
             "entity_corrections": 0,
             "soft_ack_dispatched": 0,
@@ -297,12 +299,13 @@ class NaturalConversationDirector:
     def generate_opening_instruction(self, theme: str, first_speaker_name: str) -> Dict[str, Any]:
         """既存コード互換: 最初の話者向けの開始指示を返す。"""
         instruction = (
-            f"テーマ『{theme}』について、挨拶は省き、自然な導入で短く語り始めてください。"
-            f" 相手（{first_speaker_name}の相手）が反応しやすい、具体的で一文～二文の投げかけを含めてください。"
+            f"テーマ『{theme}』について、挨拶は省き、自然な導入でやや詳しく語り始めてください。"
+            f" 相手（{first_speaker_name}の相手）が反応しやすい、具体例や観点を一つ添え、2〜4文で。"
             " 箇条書きは使わず、会話文で。"
         )
         focus_points = [
-            "簡潔 (50-90文字)",
+            "やや長め (200-300文字)",
+            "2〜4文で流れるように",
             "相手が返しやすい問いかけを添える",
             "挨拶や自己紹介はしない",
             "リスト/見出し/絵文字を使わない",
@@ -380,8 +383,11 @@ class NaturalConversationDirector:
         return random.choice(["answer", "reflect", "agree_short", "disagree_short"])
 
     def _decide_max_chars(self, stats: Dict[str, Any]) -> int:
-        # メリハリ: たまにロングターンを許可して深掘りを促す
-        long_turn = random.random() < 0.22  # 22% でロング
+        # メリハリ: たまにロングターンを許可して深掘りを促す（初期フェーズは上げ目）
+        base_prob = 0.22
+        if self.turn_counter <= 2:
+            base_prob = 0.55
+        long_turn = random.random() < base_prob
         if long_turn and stats["question_ratio"] <= QUESTION_RATIO_TARGET[1]:
             # 長め: 120〜160
             return random.choice([130, 140, 150, 160])
@@ -390,7 +396,7 @@ class NaturalConversationDirector:
             return 85
         # 短すぎる時は増量
         if stats["avg_chars_last3"] < 45:
-            return 110
+            return 120
         # 通常帯
         return 95
 
@@ -521,6 +527,31 @@ class NaturalConversationDirector:
                                 pass
                     except Exception:
                         pass
+                    # 追加: 作品名の簡易検出（引用過多の抑制や要旨確認の誘導）
+                    try:
+                        works = self._detect_classics_and_works(text0) or []
+                    except Exception:
+                        works = []
+                    # Agent向け短期ディレクティブを生成（2ターン有効）
+                    review_directives = {
+                        "required_actions": [],
+                        "ensure": ["one_concise_question"],
+                        "avoid": ["praise", "list_format"],
+                        "tone_hint": "端的/助言調",
+                        "ttl_turns": 2,
+                    }
+                    # 検索情報があればURLを1つだけ引用可
+                    if isinstance(debug_info.get("research"), list) and debug_info["research"]:
+                        review_directives["required_actions"].append("cite_one_url_if_available")
+                    # 日本外の可能性があれば地理ツッコミを促す
+                    geo = debug_info.get("geo") or {}
+                    if isinstance(geo, dict) and any((isinstance(g, dict) and g.get("in_japan") is False) for g in geo.values()):
+                        review_directives["required_actions"].append("geo_nudge")
+                    # 作品名があれば要旨確認と引用控えめ
+                    if works:
+                        review_directives["required_actions"].append("summarize_work")
+                        review_directives["avoid"].append("overuse_classics")
+                        debug_info["works_detected"] = works
                     plan = self._build_holistic_intervention_text(target_label, htx)
                     if self.soft_ack_enabled:
                         self._schedule_soft_ack(offender_label)
@@ -533,6 +564,7 @@ class NaturalConversationDirector:
                         "response_length_guide": "簡潔",
                         "confidence": 0.8,
                         "director_debug": debug_info,
+                        "review_directives": review_directives,
                     }
             # リスクがなければテンポ制御のみで返す（重い検出はスキップ）
             self._intervention_stats["rhythm_guides"] += 1
@@ -904,6 +936,59 @@ class NaturalConversationDirector:
             },
         }
 
+    # ===== 監視LLM: 履歴メトリクス計測 =====
+    def build_history_metrics_block(self, last5_texts: List[str]) -> Optional[str]:
+        """直近5ターンのテキストを監視LLMに渡し、指定フォーマットのメトリクスブロックを作らせる。
+        出力例:
+        [history-metrics]\nclassic_refs=2\nkyukokumei_refs=3\nfood_refs=1\n[/history-metrics]
+        """
+        try:
+            if not self.client:
+                return None
+            joined = "\n".join([str(t) for t in last5_texts if str(t).strip()])
+            system = (
+                "あなたは会話の監視LLMです。これから与える直近5ターンの会話テキストを読み、"
+                "次の3つの出現回数（整数）を数えて、指定フォーマットのみで出力してください。\n"
+                "- classic_refs: 古典・典籍・古典文学・古文の引用（例: 源氏物語、枕草子、徒然草、論語、平家物語 など）\n"
+                "- kyukokumei_refs: 旧国名の出現（例: 美濃、尾張、越前、近江、甲斐、武蔵 など。『〜国』の『国』は出力禁止）\n"
+                "- food_refs: 食文化・料理・味覚を用いたたとえ（例: 出汁、旨味、スパイシー、寿司、ラーメン、カレー などの比喩）\n"
+                "厳守: 下の形式のみを出力し、前後に余計な説明を一切付けない。数値は必ず整数。"
+            )
+            user = (
+                "会話（直近5ターン以内・テキスト）:\n" + joined + "\n\n"
+                "出力フォーマット:\n"
+                "[history-metrics]\n"
+                "classic_refs=〈整数〉\n"
+                "kyukokumei_refs=〈整数〉\n"
+                "food_refs=〈整数〉\n"
+                "[/history-metrics]"
+            )
+            resp = self.client.chat(
+                model=self.entity_llm_model,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                options={"temperature": 0},
+                stream=False,
+            )
+            content = (resp.get("message") or {}).get("content")
+            if not content:
+                return None
+            block = str(content).strip()
+            # 最低限のバリデーション（3行の整数）
+            import re as _re
+            m = _re.search(r"\[history-metrics\][\s\S]*?\[/history-metrics\]", block)
+            if not m:
+                return None
+            blk = m.group(0)
+            if not _re.search(r"classic_refs=\d+", blk):
+                return None
+            if not _re.search(r"kyukokumei_refs=\d+", blk):
+                return None
+            if not _re.search(r"food_refs=\d+", blk):
+                return None
+            return blk
+        except Exception:
+            return None
+
     def degrade_gracefully(self, remaining_quota: int) -> Dict[str, Any]:
         """残量に応じた機能制限ポリシー（参考実装）。"""
         if remaining_quota > 500:
@@ -1072,6 +1157,44 @@ class NaturalConversationDirector:
         except Exception:
             return None
         return None
+
+    def _detect_classics_and_works(self, text: str) -> List[str]:
+        """古典・作品名っぽい語を簡易検出（例: 源氏物語/枕草子/徒然草/論語/平家物語 など）。"""
+        try:
+            cand = []
+            # 代表的パターン: 〜物語/〜草子/〜集/〜記/論語 ほか
+            pats = [
+                r"[\u4E00-\u9FFF]{1,6}物語",
+                r"[\u4E00-\u9FFF]{1,6}草子",
+                r"[\u4E00-\u9FFF]{1,6}集",
+                r"[\u4E00-\u9FFF]{1,6}記",
+                r"論語",
+            ]
+            import re as _re
+            for p in pats:
+                for m in _re.finditer(p, text):
+                    w = m.group(0)
+                    if w and w not in cand:
+                        cand.append(w)
+            # 既知語の典型例を優先
+            known = ["源氏物語", "枕草子", "徒然草", "平家物語", "論語"]
+            for k in known:
+                if k in text and k not in cand:
+                    cand.append(k)
+            return cand[:5]
+        except Exception:
+            return []
+
+    def _summarize_or_validate_work(self, title: str) -> Dict[str, Any]:
+        """作品タイトルについてMCPで要約/存在判定し、キャッシュして返す。"""
+        if not self.use_mcp_search or not self.mcp_adapter:
+            return {"title": title, "verdict": "AMBIGUOUS"}
+        if title in self.shared_knowledge_cache:
+            return self.shared_knowledge_cache[title]
+        v, u, ex = self.mcp_adapter.verify_entity_detail(title, "ENTITY")
+        row = {"title": title, "verdict": v, "url": u, "summary": ex}
+        self.shared_knowledge_cache[title] = row
+        return row
 
     def _llm_detect_anomalies(self, text: str) -> Optional[List[Dict[str, Any]]]:
         """LLMに『おかしなもの（誤用/曖昧/疑わしい主張/架空名等）』の網羅抽出を依頼し、

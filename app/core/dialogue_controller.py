@@ -172,6 +172,14 @@ class DialogueController:
                 # デバッグ情報を透過
                 if isinstance(analysis, dict) and analysis.get("director_debug"):
                     intervention["director_debug"] = analysis.get("director_debug")
+                # review_directives があれば保持（TTL付き）
+                if isinstance(analysis, dict) and analysis.get("review_directives"):
+                    rd = analysis.get("review_directives")
+                    if isinstance(rd, dict):
+                        ttl = int(rd.get("ttl_turns", 2))
+                        rd_entry = {"data": rd, "ttl": max(1, ttl)}
+                        # 上書き（常に最新を優先）
+                        self._active_review_directives = rd_entry
                 yield {"type": "director_intervention", "data": intervention}
                 
                 # エージェントへの指示を更新
@@ -179,7 +187,7 @@ class DialogueController:
                 # 検出/検証情報を次のプロンプト生成に利用できるよう保存
                 self._stash_director_findings(intervention)
         
-        # エージェントの応答を生成
+    # エージェントの応答を生成
         yield {"type": "agent_start", "data": {"agent": current_speaker}}
         
         # 同期的に応答を生成（簡略化のため）
@@ -188,6 +196,29 @@ class DialogueController:
         findings = getattr(self, "_last_director_findings", None)
         if findings:
             context["director_findings"] = findings
+        # review_directives がアクティブなら、Agentのsystem先頭に短いブロックとして反映
+        rd_entry = getattr(self, "_active_review_directives", None)
+        if isinstance(rd_entry, dict) and isinstance(rd_entry.get("data"), dict) and rd_entry.get("ttl", 0) > 0:
+            rd = rd_entry["data"]
+            lines = []
+            # 小さな追加価値: geo_nudge の定型2種からランダムで指示語をヒント表示
+            import random as _rand
+            geo_hint = _rand.choice(["そんな場所ありましたっけ？", "それ日本の話？"]) if "geo_nudge" in (rd.get("required_actions") or []) else None
+            if geo_hint:
+                lines.append(f"- 地理の整合性に短く触れる: {geo_hint}")
+            if "summarize_work" in (rd.get("required_actions") or []):
+                lines.append("- 古典/作品は要旨を一言で触れる（引用は控えめ）")
+            if "cite_one_url_if_available" in (rd.get("required_actions") or []):
+                lines.append("- URLがあれば1つだけ添える（任意）")
+            if "one_concise_question" in (rd.get("ensure") or []):
+                lines.append("- 最後に短い質問を1つだけ")
+            avoid = rd.get("avoid") or []
+            if "overuse_classics" in avoid:
+                lines.append("- 古典の引用は続けて多用しない")
+            # 短い“From Director Review”ブロックを findings に差し込んでUserプロンプト側に見えるようにする
+            if lines:
+                context.setdefault("director_findings", {})
+                context["director_findings"]["review_block"] = "\n".join(lines)
 
         # 事前にsystem/userプロンプトを生成してUIに渡す
         try:
@@ -198,6 +229,14 @@ class DialogueController:
             # findings は1ターンのみ有効にするため使用後クリア
             if hasattr(self, "_last_director_findings"):
                 self._last_director_findings = None
+            # review_directives のTTLを消費
+            if hasattr(self, "_active_review_directives") and isinstance(getattr(self, "_active_review_directives"), dict):
+                try:
+                    self._active_review_directives["ttl"] -= 1
+                    if self._active_review_directives["ttl"] <= 0:
+                        self._active_review_directives = None
+                except Exception:
+                    self._active_review_directives = None
         except Exception:
             # 生成失敗しても続行
             system_prompt = None
@@ -218,11 +257,23 @@ class DialogueController:
             else:
                 # 同期関数の場合
                 response = current_agent.generate_response(context, system_prompt=system_prompt, user_prompt=user_prompt)
-                
         except Exception as e:
             print(f"Response generation error: {e}")
             response = "申し訳ございません、応答の生成に失敗しました。"
         
+        # 監視LLM: 直近5ターンの履歴メトリクスを末尾に付与
+        try:
+            last5 = []
+            if self.state.history:
+                for h in self.state.history[-5:]:
+                    c = h.get("content", "")
+                    last5.append(c.get("message") if isinstance(c, dict) else str(c))
+            metrics_block = self.director.build_history_metrics_block(last5) if hasattr(self.director, 'build_history_metrics_block') else None
+            if isinstance(response, str) and metrics_block:
+                response = response.rstrip() + "\n\n" + metrics_block
+        except Exception:
+            pass
+
         # If the agent returned a structured error, preserve it in the event
         if isinstance(response, dict) and response.get('error'):
             yield {"type": "agent_response", "data": {"agent": current_speaker, "response": response.get('message'), "error": True, "detail": response.get('detail')}}
@@ -473,6 +524,28 @@ class DialogueController:
                 attention_points.append("禁止事項を守る")
             if aizuchi_on and aizuchi_list:
                 attention_points.append(f"相槌可: {aizuchi_list[0]}")
+
+            # 開幕は最長にするオーバーライド（ディレクターの短い指示より優先）
+            try:
+                if getattr(self.state, 'turn_count', 0) == 1:
+                    opening_lines = [
+                        "開幕はやや長めに（200-300文字・2〜4文）",
+                        "まず導入→具体例や観点を一つ→最後に短く問いを添える",
+                        "箇条書き・見出し・絵文字は禁止"
+                    ]
+                    instruction_text = "\n".join([
+                        "話法: 導入を述べてから一つだけ問いを添える",
+                        "応答の長さ: 300文字以内・最大4文",
+                        *opening_lines
+                    ])
+                    # 注意点を上書き/強化
+                    attention_points = [
+                        "開幕のみ長め（200-300字・2〜4文）",
+                        "最後に問いは1つだけ",
+                        "禁止事項を守る",
+                    ]
+            except Exception:
+                pass
 
         # 対象エージェントへ適用
         if target_agent_key in self.agents:

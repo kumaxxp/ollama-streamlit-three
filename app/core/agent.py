@@ -250,6 +250,10 @@ class Agent:
                 prompt_parts.append("\n【レビュー補足（Director）】")
                 prompt_parts.append(str(director_findings.get('holistic_text')))
                 prompt_parts.append("上の指摘や違和感を、穏やかに一言で確かめる/ツッコむ材料として活用しても構いません。")
+            # Review directives の短い実行ブロック
+            if director_findings.get('review_block'):
+                prompt_parts.append("\n【From Director Review】")
+                prompt_parts.append(str(director_findings.get('review_block')))
         
         # 最新のDirective（長さ指示を含む）
         if self.turn_directives:
@@ -277,7 +281,7 @@ class Agent:
         is_opening = (not recent_history) and (not opponent_message)
         if is_opening:
             prompt_parts.append(f"\n上記を踏まえて、{self.character['name']}として会話を開始してください。")
-            prompt_parts.append("テーマに即した導入を述べてください。挨拶は不要です。")
+            prompt_parts.append("テーマに即した導入を述べてください。挨拶は不要です。2〜4文、200-300文字を目安に。短い問いかけ指示があっても最初は導入重視で長めに。")
         else:
             prompt_parts.append(f"\n上記を踏まえて、{opponent_name}に対して{self.character['name']}として応答してください。")
             prompt_parts.append("自然で、あなたらしい発言を心がけてください。")

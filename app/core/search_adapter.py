@@ -69,9 +69,13 @@ class MCPWebSearchAdapter:
                     s_url = f"{base}/api/rest_v1/page/summary/{httpx.URL(candidate).raw_path.decode('utf-8')}"
                     v2, u2, ex2 = self._fetch_summary_with_text(s_url)
                     return (v2 or "AMBIGUOUS", u2, ex2)
+                else:
+                    # タイトル検索で候補が何も得られない場合は NG とする
+                    return ("NG", None, None)
         except Exception:
             return ("AMBIGUOUS", None, None)
-        return ("AMBIGUOUS", None, None)
+        # ここに来るのはヒット無し等、NG相当
+        return ("NG", None, None)
 
     def _fetch_summary(self, url: str) -> Tuple[Optional[str], Optional[str]]:
         try:
