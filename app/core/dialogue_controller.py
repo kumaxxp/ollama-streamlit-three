@@ -206,6 +206,9 @@ class DialogueController:
             geo_hint = _rand.choice(["そんな場所ありましたっけ？", "それ日本の話？"]) if "geo_nudge" in (rd.get("required_actions") or []) else None
             if geo_hint:
                 lines.append(f"- 地理の整合性に短く触れる: {geo_hint}")
+            # 強い引用禁止
+            if "ban_classic_quotes" in (rd.get("required_actions") or []):
+                lines.append("- 古典/名言/物語の引用は禁止。『〜曰く』『〜のように』等は使わない。自分の言葉で述べる。")
             if "summarize_work" in (rd.get("required_actions") or []):
                 lines.append("- 古典/作品は要旨を一言で触れる（引用は控えめ）")
             if "cite_one_url_if_available" in (rd.get("required_actions") or []):
@@ -219,6 +222,34 @@ class DialogueController:
             if lines:
                 context.setdefault("director_findings", {})
                 context["director_findings"]["review_block"] = "\n".join(lines)
+                # 元ディレクティブも渡して、Agentがsystemで強制できるようにする
+                context["director_findings"]["review_directives"] = rd
+
+        # メトリクスに基づく強制ルール（分析が走っていなくても適用）
+        try:
+            mb = getattr(self, "_last_metrics_block", None)
+            metrics = self._parse_metrics_block(mb) if isinstance(mb, str) else None
+            if metrics and int(metrics.get("classic_refs", 0)) >= 3:
+                # レビュー文言を追加
+                context.setdefault("director_findings", {})
+                existing = context["director_findings"].get("review_block") or ""
+                add_line = "- 古典/名言/物語の引用は禁止。『〜曰く』『〜のように』等は使わない。自分の言葉で述べる。"
+                if add_line not in existing:
+                    context["director_findings"]["review_block"] = (existing + ("\n" if existing else "") + add_line)
+                # review_directives も合成
+                rd2 = context["director_findings"].get("review_directives") or {}
+                req = set(rd2.get("required_actions") or [])
+                req.add("ban_classic_quotes")
+                av = set(rd2.get("avoid") or [])
+                av.add("overuse_classics")
+                rd2.update({
+                    "required_actions": list(req),
+                    "avoid": list(av),
+                    "ttl_turns": max(2, int((rd2.get("ttl_turns") or 2)))
+                })
+                context["director_findings"]["review_directives"] = rd2
+        except Exception:
+            pass
 
         # 事前にsystem/userプロンプトを生成してUIに渡す
         try:
@@ -261,18 +292,16 @@ class DialogueController:
             print(f"Response generation error: {e}")
             response = "申し訳ございません、応答の生成に失敗しました。"
         
-        # 監視LLM: 直近5ターンの履歴メトリクスを末尾に付与
+        # 監視LLM: メトリクスはログに保存せず、次処理用に一時保持のみ
         try:
             last5 = []
             if self.state.history:
                 for h in self.state.history[-5:]:
                     c = h.get("content", "")
                     last5.append(c.get("message") if isinstance(c, dict) else str(c))
-            metrics_block = self.director.build_history_metrics_block(last5) if hasattr(self.director, 'build_history_metrics_block') else None
-            if isinstance(response, str) and metrics_block:
-                response = response.rstrip() + "\n\n" + metrics_block
+            self._last_metrics_block = self.director.build_history_metrics_block(last5) if hasattr(self.director, 'build_history_metrics_block') else None
         except Exception:
-            pass
+            self._last_metrics_block = None
 
         # If the agent returned a structured error, preserve it in the event
         if isinstance(response, dict) and response.get('error'):
@@ -386,6 +415,12 @@ class DialogueController:
                 "listener": listener_disp,
                 "message": message
             })
+        # メトリクスブロックがあれば、ディレクター入力の末尾メッセージに一時的に付与（ログには保存しない）
+        try:
+            if formatted and isinstance(getattr(self, "_last_metrics_block", None), str) and self._last_metrics_block.strip():
+                formatted[-1]["message"] = (formatted[-1]["message"] or "").rstrip() + "\n\n" + self._last_metrics_block
+        except Exception:
+            pass
         
         # 非同期メソッドを同期的に実行
         import asyncio
@@ -504,6 +539,25 @@ class DialogueController:
                 nl_parts.append("今回は質問は付けない")
 
             instruction_text = "\n".join(nl_parts)
+
+            # review_directives（アクティブ）に基づく強制追記: 引用禁止
+            try:
+                rd_entry = getattr(self, "_active_review_directives", None)
+                rd = rd_entry.get("data") if isinstance(rd_entry, dict) else None
+                reqs = (rd or {}).get("required_actions") if isinstance(rd, dict) else []
+                avoids = (rd or {}).get("avoid") if isinstance(rd, dict) else []
+                forbid_quotes = False
+                if isinstance(reqs, list) and "ban_classic_quotes" in reqs:
+                    forbid_quotes = True
+                if isinstance(avoids, list) and "overuse_classics" in avoids:
+                    forbid_quotes = True
+                if forbid_quotes:
+                    if "引用禁止" not in attention_points:
+                        attention_points.append("引用禁止")
+                    if "古典/名言/物語の引用は禁止" not in instruction_text:
+                        instruction_text = (instruction_text + "\n" if instruction_text else "") + "禁止: 古典/名言/物語の引用（『〜曰く』『〜のように』等）"
+            except Exception:
+                pass
 
             # 追加: geoやpushback相当の相槌が含まれる場合、自然言語で強い誘導文を添える
             try:
@@ -624,22 +678,47 @@ class DialogueController:
         # 直近履歴をUI用に整形（speaker/message 形式）
         recent: List[Dict] = []
         if self.state.history:
+            import re as _re
             for h in self.state.history[-3:]:
                 role = h.get("role", "")
                 content = h.get("content", "")
                 if isinstance(content, dict):
                     content = content.get("message", "")
+                # 表示用に history-metrics ブロックを除去（ログ内容は変更しない）
+                msg = str(content)
+                msg = _re.sub(r"\[history-metrics\][\s\S]*?\[/history-metrics\]", "", msg).strip()
                 display_name = self.agents[role].character.get("name", role) if role in self.agents else role
                 recent.append({
                     "speaker": display_name,
-                    "message": str(content)
+                    "message": msg
                 })
+
+        # メトリクスはUser Prompt専用で別セクションに出すため、コンテキストに渡すのみ
+        if isinstance(getattr(self, "_last_metrics_block", None), str) and self._last_metrics_block and self._last_metrics_block.strip():
+            metrics_block = self._last_metrics_block
+        else:
+            metrics_block = None
 
         return {
             "opponent_name": self.agents[opponent_name].character.get("name", opponent_name),
             "opponent_message": opponent_message,
-            "recent_history": recent
+            "recent_history": recent,
+            **({"metrics_block": metrics_block} if metrics_block else {})
         }
+
+    def _parse_metrics_block(self, block: Optional[str]) -> Optional[Dict[str, int]]:
+        if not block or not isinstance(block, str):
+            return None
+        try:
+            import re as _re
+            out = {}
+            for k in ("classic_refs", "kyukokumei_refs", "food_refs"):
+                m = _re.search(rf"{k}\s*=\s*(\d+)", block)
+                if m:
+                    out[k] = int(m.group(1))
+            return out or None
+        except Exception:
+            return None
     
     def _update_history(self, speaker: str, content: str) -> None:
         """履歴を更新"""

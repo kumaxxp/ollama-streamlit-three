@@ -203,9 +203,10 @@ class Agent:
         opponent_message = context.get('opponent_message', '')
         recent_history = context.get('recent_history', [])
         director_instruction = context.get('director_instruction', '')
+        metrics_block = context.get('metrics_block')
         director_findings = context.get('director_findings')
         
-        # 基本プロンプト
+        # 基本プロンプト（ユーザー表示用。指定の体裁に合わせる）
         prompt_parts = [
             f"あなたは{self.character['name']}として、{opponent_name}と対話しています。",
             f"\nテーマ: {self.session_context.get('theme', '自由討論')}",
@@ -230,7 +231,12 @@ class Agent:
             prompt_parts.append(f"\n【アドバイス】")
             prompt_parts.append(director_instruction)
 
-        # Directorの検出/検証/レビュー補足があれば追加（1ターンのみ有効）
+        # メトリクス（User Prompt専用表示）
+        if isinstance(metrics_block, str) and metrics_block.strip():
+            prompt_parts.append("\n【モニタリング】")
+            prompt_parts.append(metrics_block)
+
+    # Directorの検出/検証/レビュー補足があれば追加（1ターンのみ有効）
         if isinstance(director_findings, dict):
             # エンティティ検証
             if director_findings.get('entity_name'):
@@ -249,7 +255,13 @@ class Agent:
             if director_findings.get('holistic_text'):
                 prompt_parts.append("\n【レビュー補足（Director）】")
                 prompt_parts.append(str(director_findings.get('holistic_text')))
-                prompt_parts.append("上の指摘や違和感を、穏やかに一言で確かめる/ツッコむ材料として活用しても構いません。")
+                # 指定のガイダンス文を追加
+                prompt_parts.append("ここにある指摘は必ずツッコミ材料として短く活用してください。")
+                prompt_parts.append("解説や説明にはせず、一言の指摘や皮肉に変換してください。")
+            # 作品検証/参考のガイダンス（先頭に一度だけ）
+            if director_findings.get('works_detected') or director_findings.get('wiki_snippets'):
+                prompt_parts.append("\n【作品検証（Director）】【参考（Wikipedia検索）}")
+                prompt_parts.append("ここにある情報は事実確認用。必要に応じて一言触れてからツッコむ程度に使ってください。")
             # 作品検証があれば提示
             if director_findings.get('works_detected'):
                 ws = director_findings.get('works_detected')
@@ -274,7 +286,7 @@ class Agent:
                 sn = director_findings.get('wiki_snippets')
                 try:
                     if isinstance(sn, list) and sn:
-                        prompt_parts.append("\n【参考（Wikipedia検索）】")
+                        prompt_parts.append("\n【参考（Wikipedia検索）}")
                         s0 = sn[0]
                         if isinstance(s0, dict):
                             q = s0.get('query')
@@ -329,14 +341,25 @@ class Agent:
 
         # フォーマット指示を追加（UI表示用、生成時は構造化メッセージを使用）
         prompt_parts.append("\n【応答形式の注意】")
-        prompt_parts.append("- 挨拶（こんにちは等）は不要です。すぐに本題に入ってください")
-        prompt_parts.append("- 箇条書きや見出しは使わず、自然な会話文で応答してください")
-        prompt_parts.append("- マークダウン記号（##、**、-、・など）は使わないでください")
-        prompt_parts.append("- 普通に会話するような、流れるような文章で話してください")
-        prompt_parts.append("- 他キャラクタの発言や台本形式の会話文は書かないでください")
-        prompt_parts.append("- 出力はあなた自身の発言のみ。相手のセリフや名前は書かない")
-        prompt_parts.append("- キャラクタ名や役割（A/B等）を出力に含めない")
-        prompt_parts.append("- 出力の先頭に名前やラベル（やな:、あゆ:、A:、B:など）を付けない")
+        prompt_parts.append("- 挨拶不要。すぐに本題。")
+        prompt_parts.append("- 箇条書きや見出しは使わない。")
+        prompt_parts.append("- マークダウン記号を使わない。")
+        prompt_parts.append("- 相手のセリフや名前は書かない。")
+        prompt_parts.append("- キャラクタ名や役割（やな:、あゆ: 等）を出力に含めない。")
+        prompt_parts.append("- 出力はあなた自身の発言のみ。")
+        # 禁止事項
+        prompt_parts.append("\n【禁止事項】")
+        ban_quotes = False
+        try:
+            if isinstance(director_findings, dict):
+                rd = director_findings.get('review_directives') or {}
+                if 'ban_classic_quotes' in (rd.get('required_actions') or []):
+                    ban_quotes = True
+        except Exception:
+            ban_quotes = False
+        if ban_quotes:
+            prompt_parts.append("古典/名言/物語の引用は禁止（『〜曰く』『〜のように』等）。自分の言葉で述べる。")
+        prompt_parts.append("褒め言葉は禁止")
 
         return "\n".join(prompt_parts)
     
@@ -521,9 +544,24 @@ class Agent:
             lines.append("必要なら事実関係を短く確認してください。")
             messages.append({"role": "system", "content": "\n".join(lines)})
 
+        # review_directives が来ていたら、強制的な system 指示を前段で注入（例: 引用禁止）
+        try:
+            if isinstance(findings, dict) and findings.get('review_directives'):
+                rd = findings.get('review_directives') or {}
+                reqs = rd.get('required_actions') or []
+                avoids = rd.get('avoid') or []
+                lines = ["【遵守指示（Director）】"]
+                if 'ban_classic_quotes' in reqs or 'overuse_classics' in avoids:
+                    lines.append("- 古典/名言/物語の引用は禁止。『〜曰く』『〜のように』等を避け、自分の言葉で要点だけ述べる。")
+                if 'one_concise_question' in (rd.get('ensure') or []):
+                    lines.append("- 応答の最後に短い質問を1つだけ添える。")
+                if len(lines) > 1:
+                    messages.append({"role": "system", "content": "\n".join(lines)})
+        except Exception:
+            pass
+
         # 開始/通常の分岐
         is_opening = (len(recent) == 0 and not opponent_msg)
-
         if is_opening:
             # 開始専用の追加system（短く本題へ・名前や台本禁止を再強調）
             start_lines = [

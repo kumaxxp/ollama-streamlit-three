@@ -481,22 +481,58 @@ class NaturalConversationDirector:
         }
         mode = (mode or "balanced").lower()
 
-        # 直近の非Director発話を取得
+        # 履歴メトリクス（history-metrics ブロック）を抽出
+        metrics = self._extract_history_metrics(dialogue_context)
+        if isinstance(metrics, dict):
+            debug_info["history_metrics"] = metrics
+
+        # 直近の非Director発話とその一つ前を取得
         last_entry = None
+        prev_entry = None
         for m in reversed(dialogue_context):
             if m.get("speaker") and m.get("speaker") != "Director":
-                last_entry = m
-                break
+                if last_entry is None:
+                    last_entry = m
+                else:
+                    prev_entry = m
+                    break
 
         # 参加者A/Bの特定を更新（_analyzeはplan_next_turn内でも呼ばれているが安全のため）
         _ = self._analyze(dialogue_context)
 
         # 0) 文章ベースのホリスティック評価（JSON出力を使わず、短い助言テキストを優先）
         if last_entry and isinstance(last_entry.get("message"), str) and getattr(self, "prefer_text_llm_output", False):
-            offender_disp = last_entry.get("speaker") or ""
-            offender_label = self._label_of(offender_disp)
-            target_label = self._other(offender_label)
-            text0 = last_entry.get("message", "")
+            # 指摘/訂正モードの簡易検出（最後の発話が“確認/訂正/引用控え”を促すタイプか）
+            def _seems_correction(text: str) -> bool:
+                try:
+                    import re as _re
+                    t = (text or "").lower()
+                    # 和文/英文の代表的な訂正・確認語 + 疑問・確認表現
+                    patterns = [
+                        r"違|ちが|誤|間違|おかし|本当|ほんとう|根拠|出典|ソース|引用|どこ|ではなく|じゃない|嘘|デマ|検証|確か|wiki|wikipedia|参考|典拠|証拠",
+                    ]
+                    if _re.search("|".join(patterns), t):
+                        return True
+                    if "?" in text or "？" in text:
+                        # 疑問符単独では弱いが、直前が反論/確認語なら強い
+                        return True
+                except Exception:
+                    pass
+                return False
+
+            last_disp = last_entry.get("speaker") or ""
+            last_text = last_entry.get("message", "")
+            critic_mode = _seems_correction(last_text)
+            # オフエンダー = 直前の相手発話（指摘モード時）、通常は最終発話者
+            if critic_mode and prev_entry and prev_entry.get("speaker"):
+                offender_disp = prev_entry.get("speaker")
+                offender_label = self._label_of(offender_disp)
+                target_label = self._label_of(last_disp)  # 指摘側に“穏やかな確認/一言質問”を促す
+            else:
+                offender_disp = last_disp
+                offender_label = self._label_of(offender_disp)
+                target_label = self._other(offender_label)
+            text0 = last_text
             try:
                 htx = self._llm_holistic_review_text(text0, dialogue_context)
             except Exception:
@@ -577,6 +613,15 @@ class NaturalConversationDirector:
                         "tone_hint": "端的/助言調",
                         "ttl_turns": 2,
                     }
+                    # 強い引用禁止（履歴で古典引用が多すぎる場合）
+                    try:
+                        cref = int((metrics or {}).get("classic_refs", 0))
+                        if cref >= 12:
+                            review_directives["required_actions"].append("ban_classic_quotes")
+                            if "overuse_classics" not in review_directives["avoid"]:
+                                review_directives["avoid"].append("overuse_classics")
+                    except Exception:
+                        pass
                     # 検索情報があればURLを1つだけ引用可
                     if isinstance(debug_info.get("research"), list) and debug_info["research"]:
                         review_directives["required_actions"].append("cite_one_url_if_available")
@@ -602,6 +647,18 @@ class NaturalConversationDirector:
                                     review_directives["required_actions"].append("offer_correction")
                     # 1回目のプラン
                     plan = self._build_holistic_intervention_text(target_label, htx)
+                    # 指摘モードなら、話法を穏やかな確認（ask）寄りに補正
+                    try:
+                        if critic_mode and isinstance(plan, dict):
+                            ts = plan.get("turn_style", {})
+                            ts["speech_act"] = "ask"
+                            pre = ts.get("preface", {}) or {}
+                            pre["aizuchi"] = True
+                            pre["aizuchi_list"] = ["ちょっと確認だけど…"]
+                            ts["preface"] = pre
+                            plan["turn_style"] = ts
+                    except Exception:
+                        pass
                     # 証拠(wiki_snippets)があるなら、2回目のホリスティック再レビューで指示を強化
                     try:
                         wiki_snips = debug_info.get("wiki_snippets") or []
@@ -634,7 +691,15 @@ class NaturalConversationDirector:
                                         review_directives["tone_hint"] = ad.get("tone_hint")
                     except Exception:
                         pass
+                    # ツッコミ材料（research/wiki_snippets/works）あり→長さを約3倍に拡張（上限260）
+                    try:
+                        has_materials = bool(debug_info.get("research") or debug_info.get("wiki_snippets") or debug_info.get("works_detected"))
+                        if has_materials:
+                            plan = self._scale_plan_length(plan, factor=3, cap=260)
+                    except Exception:
+                        pass
                     if self.soft_ack_enabled:
+                        # オフエンダー側には軽い受け流し（soft-ack）を予定
                         self._schedule_soft_ack(offender_label)
                         self._intervention_stats["soft_ack_dispatched"] += 1
                     return {
@@ -686,7 +751,11 @@ class NaturalConversationDirector:
                         if row.get("verdict") in ("NG", "AMBIGUOUS"):
                             flagged = True
                     if flagged:
-                        target_label = self._other(self._label_of(offender_disp))
+                        # 指摘モードなら、次話者=指摘側。それ以外は通常どおり交代
+                        if critic_mode and last_entry and last_entry.get("speaker"):
+                            target_label = self._label_of(last_entry.get("speaker"))
+                        else:
+                            target_label = self._other(self._label_of(offender_disp))
                         # 短いツッコミを促すディレクティブ
                         review_directives = {
                             "required_actions": ["offer_correction", "one_concise_question"],
@@ -696,6 +765,20 @@ class NaturalConversationDirector:
                         }
                         pb = "そんな言葉ないですよ。別の表現のこと？"
                         plan = self._build_pushback_plan(target_label, pb)
+                        # 指摘モード時は、より穏やかな確認トーンに補正
+                        try:
+                            if critic_mode and isinstance(plan, dict):
+                                ts = plan.get("turn_style", {})
+                                ts["speech_act"] = "ask"
+                                pre = ts.get("preface", {}) or {}
+                                pre["aizuchi"] = True
+                                pre["aizuchi_list"] = ["ごめん、確認なんだけど…"]
+                                ts["preface"] = pre
+                                plan["turn_style"] = ts
+                        except Exception:
+                            pass
+                        # 引用誤りのツッコミ材料あり→長さを拡張
+                        plan = self._scale_plan_length(plan, factor=3, cap=260)
                         if self.soft_ack_enabled:
                             self._schedule_soft_ack(self._label_of(offender_disp))
                             self._intervention_stats["soft_ack_dispatched"] += 1
@@ -712,16 +795,30 @@ class NaturalConversationDirector:
                 except Exception:
                     pass
             # 引用もなく完全に安全→テンポ制御のみ
-            self._intervention_stats["rhythm_guides"] += 1
-            return {
-                "intervention_needed": True,
-                "reason": "rhythm_control",
-                "intervention_type": "length_tempo_speech_act",
-                "message": json.dumps(cmd_rhythm, ensure_ascii=False),
-                "response_length_guide": "簡潔",
-                "confidence": 0.8,
-                "director_debug": debug_info,
-            }
+                self._intervention_stats["rhythm_guides"] += 1
+                # 強い引用禁止のレビュー指示だけ配布（必要時）
+                review_directives = None
+                try:
+                    cref = int((metrics or {}).get("classic_refs", 0))
+                    if cref >= 12:
+                        review_directives = {
+                            "required_actions": ["ban_classic_quotes", "one_concise_question"],
+                            "avoid": ["praise", "list_format", "overuse_classics"],
+                            "tone_hint": "端的/助言調",
+                            "ttl_turns": 2,
+                        }
+                except Exception:
+                    review_directives = None
+                return {
+                    "intervention_needed": True,
+                    "reason": "rhythm_control",
+                    "intervention_type": "length_tempo_speech_act",
+                    "message": json.dumps(cmd_rhythm, ensure_ascii=False),
+                    "response_length_guide": "簡潔",
+                    "confidence": 0.8,
+                    "director_debug": debug_info,
+                    **({"review_directives": review_directives} if review_directives else {}),
+                }
 
     # 1) 固有名詞チェック → 訂正促し（指摘するのは「発言者と別のAI」= 直近発話者の反対側）
         if last_entry and isinstance(last_entry.get("message"), str):
@@ -911,6 +1008,8 @@ class NaturalConversationDirector:
                 if problem_names:
                     self._intervention_stats["entity_checks"] += len(selected)
                     plan = self._build_entity_correction_plan(target_label, problem_names)
+                    # エンティティ誤用の具体材料あり→長さを拡張
+                    plan = self._scale_plan_length(plan, factor=3, cap=260)
                     if self.soft_ack_enabled:
                         self._schedule_soft_ack(offender_label)
                         self._intervention_stats["soft_ack_dispatched"] += 1
@@ -961,6 +1060,8 @@ class NaturalConversationDirector:
                                             else:
                                                 entity_hint = err_entity if err_entity else "該当の名称"
                                                 plan = self._build_entity_correction_plan(target_label, entity_hint)
+                                            # Gemini検出の材料あり→長さを拡張
+                                            plan = self._scale_plan_length(plan, factor=3, cap=260)
                                             if self.soft_ack_enabled:
                                                 self._schedule_soft_ack(offender_label)
                                                 self._intervention_stats["soft_ack_dispatched"] += 1
@@ -1331,11 +1432,19 @@ class NaturalConversationDirector:
                     lines.append(f"[{i}] {t} | {u} | {ex_short}")
             ev_text = "\n".join(lines)
 
+            participants = [p for p in (self.participants or []) if p]
+            part_note = "、".join(participants) if participants else None
             system = (
                 "あなたは対話監督のレビュアです。以下の発話と参考情報(要約/URL)を踏まえて、\n"
                 "おかしさの指摘・短いツッコミ(pushback)・次ターン用の行動指示(agent_directives)をJSONで返してください。\n"
                 "行動指示は『1つだけ短い質問』『可能ならURLを1つだけ』『誤記疑いならやわらかく確認』『引用控えめ』などを含めてください。"
             )
+            if part_note:
+                system += (
+                    f"\n参加者: {part_note}\n"
+                    "注意: 上記参加者名やそれらの呼称/あだ名/短縮形は会話上の相手を指すものとして扱い、"
+                    "『誰を指すか不明』の指摘対象に含めない。"
+                )
             user = (
                 "発話:\n" + text + "\n\n"
                 "参考情報(上位):\n" + ev_text + "\n\n"
@@ -1538,10 +1647,18 @@ class NaturalConversationDirector:
                         break
             except Exception:
                 pass
+            participants = [p for p in (self.participants or []) if p]
+            part_note = "、".join(participants) if participants else None
             sys_prompt = (
                 "あなたは対話ディレクターのレビュアです。以下の日本語発話について、意味の通りに簡潔にレビューし、"
                 "曖昧・誤認・場所や時代の取り違え・ありえない主張がないかを人間にわかる文章で短く指摘してください。"
                 "次の点を含め、箇条書きではなく2-4文の簡潔な日本語で:")
+            if part_note:
+                sys_prompt += (
+                    f"\n参加者: {part_note}\n"
+                    "注意: 上記参加者名やそれらの呼称/あだ名/短縮形は会話上の相手を指すものとして扱い、"
+                    "『誰を指すか不明』の指摘対象に含めない。"
+                )
             if theme:
                 sys_prompt += f"\n会話のテーマ参考: {theme}\n"
             user_prompt = (
@@ -1620,6 +1737,92 @@ class NaturalConversationDirector:
             "cadence": {"avoid_consecutive_monologues": True},
             "closing_hint": "続ける",
         }
+        return plan
+
+    def _extract_history_metrics(self, dialogue_context: List[Dict[str, Any]]) -> Optional[Dict[str, int]]:
+        """履歴に含まれる [history-metrics] ブロックを後方から1つだけ抽出して辞書化。"""
+        import re as _re
+        try:
+            texts = []
+            for m in reversed(dialogue_context):
+                msg = m.get("message") or ""
+                if isinstance(msg, str) and msg.strip():
+                    texts.append(msg)
+                if len(texts) >= 4:
+                    break
+            blob = "\n".join(texts)
+            start = blob.rfind("[history-metrics]")
+            end = blob.rfind("[/history-metrics]")
+            if start >= 0 and end > start:
+                segment = blob[start:end]
+                out = {}
+                for k in ("classic_refs", "kyukokumei_refs", "food_refs"):
+                    m = _re.search(rf"{k}\s*=\s*(\d+)", segment)
+                    if m:
+                        out[k] = int(m.group(1))
+                return out if out else None
+        except Exception:
+            return None
+        return None
+
+    def _llm_select_search_targets(self, last_text: str, review_text: Optional[str]) -> Optional[List[Dict[str, Any]]]:
+        """LLMに『検索すべき対象』を選ばせる。固有名詞(PERSON/ORG/EVENT/ENTITY)と作品(WORK)のみ。
+        期待JSON: {"targets":[{"label":str,"kind":"PERSON|ORG|EVENT|ENTITY|WORK"}]}
+        """
+        if not self.client:
+            return None
+        try:
+            sys = (
+                "あなたはレビュー補助です。直近の発話とレビュー文を読み、検索すべき対象だけを選んでください。"
+                "一般語や説明語は除外し、固有名詞(PERSON/ORG/EVENT/ENTITY)と、引用/作品/書名など( WORK )に限定。"
+                "3件以内。JSONのみ。"
+            )
+            user = (
+                "発話:\n" + (last_text or "") + "\n\n"
+                "レビュー:\n" + (review_text or "") + "\n\n"
+                "出力:\n{\n  \"targets\": [ {\"label\": string, \"kind\": \"PERSON|ORG|EVENT|ENTITY|WORK\"} ]\n}"
+            )
+            resp = self.client.chat(
+                model=self.entity_llm_model,
+                messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+                options={"temperature": 0},
+                stream=False,
+            )
+            content = (resp.get("message") or {}).get("content")
+            if not content:
+                return None
+            s = str(content).strip()
+            a = s.find("{"); b = s.rfind("}")
+            if a >= 0 and b > a:
+                s = s[a:b+1]
+            data = json.loads(s)
+            arr = (data or {}).get("targets")
+            if isinstance(arr, list):
+                out: List[Dict[str, Any]] = []
+                for it in arr[:3]:
+                    if isinstance(it, dict) and (it.get("label") or "").strip():
+                        out.append({
+                            "label": (it.get("label") or "").strip(),
+                            "kind": str(it.get("kind") or "ENTITY").upper()
+                        })
+                return out
+        except Exception:
+            return None
+        return None
+
+    def _scale_plan_length(self, plan: Dict[str, Any], factor: int = 3, cap: int = 260) -> Dict[str, Any]:
+        """turn_style.length.max_chars を係数で拡張（上限cap）。失敗時はそのまま返す。"""
+        try:
+            ts = plan.get("turn_style", {})
+            length = ts.get("length", {})
+            max_chars = int(length.get("max_chars")) if length.get("max_chars") is not None else None
+            if max_chars:
+                new_len = max_chars * max(1, int(factor))
+                length["max_chars"] = min(cap, int(new_len))
+                ts["length"] = length
+                plan["turn_style"] = ts
+        except Exception:
+            return plan
         return plan
 
     # ===== Judgeユーティリティ(任意) =====
