@@ -271,6 +271,18 @@ class DialogueController:
             if isinstance(htext, str) and htext.strip():
                 findings["holistic_text"] = htext.strip()
 
+            # 追加: その場検索の結果(research)があれば共有
+            research = dbg.get("research")
+            if isinstance(research, list) and research:
+                # 1件目だけを短く格納
+                r0 = research[0]
+                findings["research"] = {
+                    "query": r0.get("query"),
+                    "verdict": r0.get("verdict"),
+                    "evidence": r0.get("evidence"),
+                    "evidence_excerpt": (r0.get("evidence_text") or "")[:280]
+                }
+
             # 何かしらあれば保存
             if len(findings) > 1:  # timestamp 以外がある
                 self._last_director_findings = findings
@@ -432,6 +444,25 @@ class DialogueController:
                 nl_parts.append("今回は質問は付けない")
 
             instruction_text = "\n".join(nl_parts)
+
+            # 追加: geoやpushback相当の相槌が含まれる場合、自然言語で強い誘導文を添える
+            try:
+                dbg = intervention.get("director_debug") if isinstance(intervention, dict) else None
+                extra_lines: List[str] = []
+                if isinstance(dbg, dict):
+                    # geo 情報から日本外の可能性をツッコミ候補に
+                    geo = dbg.get("geo") or {}
+                    if isinstance(geo, dict) and geo:
+                        for k, g in list(geo.items())[:1]:
+                            if g and g.get("in_japan") is False:
+                                extra_lines.append(f"地理の整合性に注意。『{k}』は日本外の位置です。『そんな場所ありましたっけ？』のニュアンスで短く確認してOK。")
+                if aizuchi_on and aizuchi_list:
+                    # pushback候補の相槌があるなら、それを冒頭に必ず置くよう明示
+                    extra_lines.append("冒頭に上記の短いツッコミ相槌を必ず1つ置いてから、1文だけ確認する。")
+                if extra_lines:
+                    instruction_text = instruction_text + "\n" + "\n".join(extra_lines)
+            except Exception:
+                pass
 
             # 注意点（UI側で拾われる想定）
             if max_chars or max_sent:

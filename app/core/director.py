@@ -141,7 +141,9 @@ class GeminiErrorDetector:
             prompt = (
                 "以下の発話を同時に分析し、それぞれについて次を検出しJSONで返してください:\n"
                 "1) 事実誤認 2) 論理矛盾 3) ハルシネーション 4) 固有名詞の誤用\n"
-                "必ず次の形式で: {\"results\":[{\"id\":str,\"errors\":[{\"type\":str,\"detail\":str,\"entity\":str|null}]}]}\n\n"
+                "問題点の検出仕様はそのままに、各発話について発言者に向けた短い『ツッコミ/訂正要求』文も1つ生成してください。\n"
+                "出力要件: JSONのみ。pushback は日本語で20-60文字、具体的で端的に（丁寧すぎない助言調、例:『それ名前違う。○○のこと？』）。\n"
+                "必ず次の形式で: {\"results\":[{\"id\":str,\"errors\":[{\"type\":str,\"detail\":str,\"entity\":str|null}],\"pushback\":str}]}\n\n"
                 + json.dumps(batch, ensure_ascii=False)
             )
             resp = self._model.generate_content(prompt)
@@ -496,6 +498,29 @@ class NaturalConversationDirector:
             if isinstance(htx, dict):
                 debug_info["holistic_text"] = htx.get("full_text")
                 if bool(htx.get("risk")):
+                    # もしレビューが検索キーワードを含むなら、その場でMCPで軽い検索を実施し共有用に格納
+                    try:
+                        queries = htx.get("queries") or []
+                        if self.use_mcp_search and self.mcp_adapter and isinstance(queries, list) and queries:
+                            q0 = str(queries[0])
+                            v, u, ex = self.mcp_adapter.verify_entity_detail(q0, "ENTITY")
+                            debug_info["research"] = [{
+                                "query": q0,
+                                "verdict": v,
+                                "evidence": u,
+                                "evidence_text": ex,
+                            }]
+                            # 追加: 地理座標が取れれば日本内外の簡易判定を付与
+                            try:
+                                lat, lon, in_jp = self.mcp_adapter.get_coordinates(q0)
+                                if lat is not None and lon is not None:
+                                    debug_info.setdefault("geo", {})[q0] = {
+                                        "lat": lat, "lon": lon, "in_japan": in_jp
+                                    }
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                     plan = self._build_holistic_intervention_text(target_label, htx)
                     if self.soft_ack_enabled:
                         self._schedule_soft_ack(offender_label)
@@ -680,6 +705,16 @@ class NaturalConversationDirector:
                     if isinstance(ec, dict):
                         evidence = ec.get("evidence")
                         evidence_text = ec.get("evidence_text")
+                    # 追加: 地理候補であれば座標も試行（雑にENTITY全般で試し、日本内外を持つ）
+                    try:
+                        if self.use_mcp_search and self.mcp_adapter and etype in ("EVENT", "ENTITY"):
+                            lat, lon, in_jp = self.mcp_adapter.get_coordinates(name)
+                            if lat is not None and lon is not None:
+                                debug_info.setdefault("geo", {})[name] = {
+                                    "lat": lat, "lon": lon, "in_japan": in_jp
+                                }
+                    except Exception:
+                        pass
                     vrow = {"name": name, "type": etype, "verdict": verdict, "evidence": evidence, "evidence_text": evidence_text}
                     verifications.append(vrow)
                     if verdict in ("AMBIGUOUS", "NG"):
@@ -735,6 +770,7 @@ class NaturalConversationDirector:
                                 for r in results:
                                     if r.get("id") == f"turn-{self.turn_counter}":
                                         errs = r.get("errors") or []
+                                        pushback_txt = (r.get("pushback") or "").strip()
                                         # 固有名詞誤用などがあれば軽い指摘を優先
                                         err_entity = None
                                         for e in errs:
@@ -742,8 +778,12 @@ class NaturalConversationDirector:
                                                 err_entity = e.get("entity")
                                                 break
                                         if errs:
-                                            entity_hint = err_entity if err_entity else "該当の名称"
-                                            plan = self._build_entity_correction_plan(target_label, entity_hint)
+                                            # pushback があればそれを優先してツッコミ/訂正要求の発話を誘導
+                                            if pushback_txt:
+                                                plan = self._build_pushback_plan(target_label, pushback_txt)
+                                            else:
+                                                entity_hint = err_entity if err_entity else "該当の名称"
+                                                plan = self._build_entity_correction_plan(target_label, entity_hint)
                                             if self.soft_ack_enabled:
                                                 self._schedule_soft_ack(offender_label)
                                                 self._intervention_stats["soft_ack_dispatched"] += 1
@@ -1222,6 +1262,26 @@ class NaturalConversationDirector:
         # 補助: 検索キーワードの示唆を director_debug にも載せる想定だが、ここではplanに含めず最低限
         if q:
             plan["note"] = {"query_suggest": q}
+        return plan
+
+    def _build_pushback_plan(self, target_label: str, pushback_text: str) -> Dict[str, Any]:
+        """Geminiのpushback短文を使い、そのまま短くツッコミ/訂正要求させる発話計画。"""
+        # pushback_text を相づちとして埋め込み、短い反論/確認を促す
+        pb = self.auto_repair(pushback_text, max_chars=70)
+        if not pb:
+            pb = "それ、事実関係あやしい。具体的な根拠ある？"
+        plan = {
+            "turn_style": {
+                "speaker": target_label,
+                "length": {"max_chars": 80, "max_sentences": 2},
+                "preface": {"aizuchi": True, "aizuchi_list": [pb], "prob": 1.0},
+                "speech_act": "disagree_short",
+                "follow_up": "ask_feel",
+                "ban": ["praise", "list_format", "long_intro"],
+            },
+            "cadence": {"avoid_consecutive_monologues": True},
+            "closing_hint": "続ける",
+        }
         return plan
 
     # ===== Judgeユーティリティ(任意) =====

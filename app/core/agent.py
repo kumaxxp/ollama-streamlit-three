@@ -461,6 +461,21 @@ class Agent:
             note_lines.append("必要に応じてこの情報を活用してください。（やわらかい確認/補足が望ましい）")
             messages.append({"role": "system", "content": "\n".join(note_lines)})
 
+        # 追加: 研究結果(research)の共有（URLと短い抜粋）
+        if isinstance(findings, dict) and findings.get("research"):
+            r = findings["research"]
+            lines = ["【補足検索（Director）】"]
+            if r.get("query"):
+                lines.append(f"クエリ: {r.get('query')}")
+            if r.get("verdict"):
+                lines.append(f"判定: {r.get('verdict')}")
+            if r.get("evidence"):
+                lines.append(f"参考URL: {r.get('evidence')}")
+            if r.get("evidence_excerpt"):
+                lines.append("要約: " + str(r.get("evidence_excerpt")))
+            lines.append("必要なら事実関係を短く確認してください。")
+            messages.append({"role": "system", "content": "\n".join(lines)})
+
         # 開始/通常の分岐
         is_opening = (len(recent) == 0 and not opponent_msg)
 

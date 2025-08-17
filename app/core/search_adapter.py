@@ -114,3 +114,31 @@ class MCPWebSearchAdapter:
                 return ("AMBIGUOUS", page_url, extract)
         except Exception:
             return (None, None, None)
+
+    def get_coordinates(self, name: str) -> Tuple[Optional[float], Optional[float], Optional[bool]]:
+        """Wikipedia summaryから座標を取得し、日本国内かどうかの簡易判定を返す。
+        Returns: (lat, lon, in_japan) 失敗時は (None, None, None)
+        """
+        if not httpx:
+            return (None, None, None)
+        q = (name or "").strip()
+        if not q:
+            return (None, None, None)
+        base = f"https://{self.lang}.wikipedia.org"
+        summary_url = f"{base}/api/rest_v1/page/summary/{httpx.URL(q).raw_path.decode('utf-8')}"
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                r = client.get(summary_url, headers={"accept": "application/json"})
+                if r.status_code != 200:
+                    return (None, None, None)
+                data = r.json()
+                coords = data.get("coordinates") or {}
+                lat = coords.get("lat")
+                lon = coords.get("lon")
+                if lat is None or lon is None:
+                    return (None, None, None)
+                # 日本国内かの簡易判定（概ねの範囲）
+                in_japan = (24.0 <= float(lat) <= 46.5) and (122.0 <= float(lon) <= 153.0)
+                return (float(lat), float(lon), bool(in_japan))
+        except Exception:
+            return (None, None, None)
