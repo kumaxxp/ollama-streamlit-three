@@ -101,6 +101,12 @@ class DialogueController:
             ollama_client=self.ollama_client,
             model_name=director_model
         )
+        # Directorへセッションテーマを共有（オフトピック検知用）
+        try:
+            if hasattr(self.director, 'session_theme'):
+                self.director.session_theme = self.config.theme
+        except Exception:
+            pass
         
         # DialogueManagerを初期化
         self.dialogue_manager = DialogueManager(

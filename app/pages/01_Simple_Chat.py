@@ -7,6 +7,7 @@ import streamlit as st
 import ollama
 from datetime import datetime
 import json
+import re
 
 # ページ設定
 st.set_page_config(
@@ -123,6 +124,28 @@ Top P: {top_p}
 st.title("🤖 Ollama Chat Interface")
 st.caption(f"使用モデル: {st.session_state.model}")
 
+
+def _sanitize_output(text: str) -> str:
+    """UI表示用に思考過程（CoT）を除去する軽量フィルタ"""
+    try:
+        s = str(text)
+        # タグ形式
+        s = re.sub(r"(?is)<\s*(think|thought|scratchpad)\b[^>]*>.*?<\s*/\s*\1\s*>", "", s)
+        s = re.sub(r"(?is)<\s*(think|thought|scratchpad)\b[^>]*>[\s\S]*$", "", s)
+        # フェンス付きコードブロック
+        s = re.sub(r"(?is)```\s*(reasoning|thought|think)[\s\S]*?```", "", s)
+        s = re.sub(r"(?is)```\s*(reasoning|thought|think)[\s\S]*$", "", s)
+        # 日本語ラベル
+        s = re.sub(r"(?s)【思考】[\s\S]*?【/思考】", "", s)
+        s = re.sub(r"(?s)【思考】[\s\S]*$", "", s)
+        # 行頭の『思考:』など
+        s = re.sub(r"(?mi)^(思考|推論|考え|Reasoning|Thoughts?)\s*[:：].*$\n?", "", s)
+        # 連続改行の整理
+        s = re.sub(r"\n{3,}", "\n\n", s).strip()
+        return s
+    except Exception:
+        return text
+
 # チャット履歴表示
 chat_container = st.container()
 with chat_container:
@@ -155,6 +178,9 @@ if prompt := st.chat_input("メッセージを入力してください..."):
                     options={
                         "temperature": st.session_state.temperature,
                         "top_p": top_p,
+                        # 安全な既定: KVキャッシュ/VRAM圧迫を抑える
+                        "num_ctx": 4096,
+                        "num_batch": 128,
                         "num_predict": max_tokens,
                     }
                 )
@@ -163,9 +189,10 @@ if prompt := st.chat_input("メッセージを入力してください..."):
                 for chunk in stream:
                     if chunk['message']['content']:
                         full_response += chunk['message']['content']
-                        message_placeholder.markdown(full_response + "▌")
+                        display_text = _sanitize_output(full_response)
+                        message_placeholder.markdown(display_text + "▌")
                 
-                message_placeholder.markdown(full_response)
+                message_placeholder.markdown(_sanitize_output(full_response))
         
         except Exception as e:
             st.error(f"エラーが発生しました: {e}")
@@ -173,7 +200,7 @@ if prompt := st.chat_input("メッセージを入力してください..."):
             message_placeholder.markdown(full_response)
     
     # アシスタントメッセージを履歴に追加
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
+    st.session_state.messages.append({"role": "assistant", "content": _sanitize_output(full_response)})
 
 # フッター
 st.divider()

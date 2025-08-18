@@ -39,6 +39,19 @@
           "director": 0.3
         },
         "priority": 3
+      },
+      {
+        "name": "qwen3:8b",
+        "display_name": "Qwen 3 8B",
+        "description": "最新のQwenモデル、バランスの取れた性能",
+        "size": "6.5GB",
+        "vram_required": "8GB",
+        "recommended_for": ["dialogue", "creative"],
+        "temperature": {
+          "agent": 0.7,
+          "director": 0.3
+        },
+        "priority": 3
       }
     ],
     "lightweight": [

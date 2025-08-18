@@ -253,6 +253,12 @@ class NaturalConversationDirector:
         except Exception:
             self.prefer_text_llm_output = True
 
+        # リフォーカス（オフトピック）制御
+        self.session_theme = None
+        self._eval_calls = 0
+        self._last_refocus_eval = -999
+        self._refocus_cooldown = 3  # 何回の分析間隔おきに許可するか
+
     def plan_next_turn(self, dialogue_context: List[Dict[str, Any]]) -> Dict[str, Any]:
         """リズム/長さ/話法のガイドを決める。"""
         stats = self._analyze(dialogue_context)
@@ -412,6 +418,53 @@ class NaturalConversationDirector:
             return "締めに向かう"
         return "続ける"
 
+    # ===== オフトピック検知とリフォーカス =====
+    def _detect_offtopic(self, dialogue_context: List[Dict[str, Any]], theme: Optional[str]) -> Tuple[bool, Optional[str]]:
+        """簡易ヒューリスティクスでテーマ逸脱を検出。テーマ主要語と直近2発話の主要語の重なりが0ならオフトピック。
+        """
+        try:
+            import re as _re
+            def key_tokens(s: str) -> List[str]:
+                if not s:
+                    return []
+                t = _re.sub(r"[\s、。.,!！?？\-:：/（）()\[\]『』「」]", " ", s)
+                toks = [w for w in t.split() if len(w) >= 2]
+                stop = {"こと","もの","それ","これ","ため","よう","とか","から","ので","です","ます","する","ある","いる","的","場合","時","思う","感じ"}
+                return [w for w in toks if w not in stop]
+
+            last_msgs = [m.get("message", "") for m in dialogue_context if isinstance(m, dict) and m.get("speaker") != "Director"][-2:]
+            if not last_msgs:
+                return (False, None)
+            theme_keys = set(key_tokens(theme or ""))
+            if not theme_keys:
+                return (False, None)
+            recent_keys = set(key_tokens(" ".join(last_msgs)))
+            overlap = theme_keys.intersection(recent_keys)
+            length_ok = sum(len(x) for x in last_msgs) >= 30
+            if length_ok and len(overlap) == 0:
+                return (True, "no_theme_overlap")
+        except Exception:
+            return (False, None)
+        return (False, None)
+
+    def _build_refocus_plan(self, theme: str, target_label: str = "B") -> Dict[str, Any]:
+        tip = f"本筋に戻そう。テーマ『{theme}』の中で一つに絞って話そう"
+        question = f"じゃあ『{theme}』で、いちばん気になる論点は？"
+        plan = {
+            "turn_style": {
+                "speaker": target_label,
+                "length": {"max_chars": 100, "max_sentences": 2},
+                "preface": {"aizuchi": True, "aizuchi_list": [tip], "prob": 1.0},
+                "speech_act": "ask",
+                "follow_up": "none",
+                "ban": ["long_intro", "list_format", "praise"],
+            },
+            "cadence": {"avoid_consecutive_monologues": True},
+            "closing_hint": "続ける",
+            "note": {"refocus": True, "theme": theme, "reset_prompt": question},
+        }
+        return plan
+
     def _other(self, s: Optional[str]) -> str:
         """与えられた話者（表示名または 'A'/'B'）の反対側ラベルを返す。"""
         if s is None:
@@ -470,6 +523,11 @@ class NaturalConversationDirector:
         """
         # まず通常のリズム計画を用意（フォールバック用）
         cmd_rhythm = self.plan_next_turn(dialogue_context)
+        # 呼び出しカウンタ
+        try:
+            self._eval_calls += 1
+        except Exception:
+            self._eval_calls = 1
         debug_info: Dict[str, Any] = {
             "heuristic_entities": [],
             "llm_entities": [],
@@ -499,6 +557,27 @@ class NaturalConversationDirector:
 
         # 参加者A/Bの特定を更新（_analyzeはplan_next_turn内でも呼ばれているが安全のため）
         _ = self._analyze(dialogue_context)
+
+        # 早期: オフトピック検知 → リフォーカス
+        try:
+            theme = self.session_theme
+            offtopic, reason = self._detect_offtopic(dialogue_context, theme)
+        except Exception:
+            offtopic, reason = (False, None)
+        if offtopic and (self._eval_calls - self._last_refocus_eval >= self._refocus_cooldown):
+            target_label = "B"  # Agent2 を既定に
+            plan = self._build_refocus_plan(theme or "この対話のテーマ", target_label)
+            self._last_refocus_eval = self._eval_calls
+            debug_info["offtopic"] = {"detected": True, "reason": reason or "theme_mismatch"}
+            return {
+                "intervention_needed": True,
+                "reason": "offtopic_refocus",
+                "intervention_type": "refocus_or_reset",
+                "message": json.dumps(plan, ensure_ascii=False),
+                "response_length_guide": "簡潔",
+                "confidence": 0.75,
+                "director_debug": debug_info,
+            }
 
         # 0) 文章ベースのホリスティック評価（JSON出力を使わず、短い助言テキストを優先）
         if last_entry and isinstance(last_entry.get("message"), str) and getattr(self, "prefer_text_llm_output", False):
@@ -635,6 +714,7 @@ class NaturalConversationDirector:
                         review_directives["avoid"].append("overuse_classics")
                         debug_info["works_detected"] = []
                         # 各作品を即時に検証し、存在しない/曖昧は NG/AMBIGUOUS として注記
+                        verified_found = False
                         for w in works[:3]:
                             try:
                                 row = self._summarize_or_validate_work(w)
@@ -645,6 +725,14 @@ class NaturalConversationDirector:
                                 # NG/曖昧なら、誤記/架空の可能性を短く確認する行動を促す
                                 if "offer_correction" not in review_directives["required_actions"]:
                                     review_directives["required_actions"].append("offer_correction")
+                            elif row.get("verdict") == "VERIFIED":
+                                verified_found = True
+                        # VERIFIED が含まれる場合は、文脈との関連性を確認し、無関係なら強めの指摘を許可
+                        if verified_found:
+                            if "check_verified_relevance" not in review_directives["required_actions"]:
+                                review_directives["required_actions"].append("check_verified_relevance")
+                            # 口調ヒントを少し強めに
+                            review_directives["tone_hint"] = review_directives.get("tone_hint") or "端的/少し強めに"
                     # 1回目のプラン
                     plan = self._build_holistic_intervention_text(target_label, htx)
                     # 指摘モードなら、話法を穏やかな確認（ask）寄りに補正
@@ -745,11 +833,14 @@ class NaturalConversationDirector:
                         pass
                     # 判定
                     flagged = False
+                    verified_found = False
                     for w in works[:3]:
                         row = self._summarize_or_validate_work(w)
                         debug_info["works_detected"].append(row)
                         if row.get("verdict") in ("NG", "AMBIGUOUS"):
                             flagged = True
+                        elif row.get("verdict") == "VERIFIED":
+                            verified_found = True
                     if flagged:
                         # 指摘モードなら、次話者=指摘側。それ以外は通常どおり交代
                         if critic_mode and last_entry and last_entry.get("speaker"):
@@ -794,18 +885,28 @@ class NaturalConversationDirector:
                         }
                 except Exception:
                     pass
-            # 引用もなく完全に安全→テンポ制御のみ
+            # 全て VERIFIED で安全だが、引用が文脈に無関係な可能性がある→テンポ制御 + 関連性チェック指示を返す
                 self._intervention_stats["rhythm_guides"] += 1
-                # 強い引用禁止のレビュー指示だけ配布（必要時）
-                review_directives = None
+                # レビュー指示: verified の関連性チェック（あれば） + 強い引用禁止（必要時）
+                review_directives = {}
                 try:
                     cref = int((metrics or {}).get("classic_refs", 0))
+                    req: List[str] = []
+                    ensure: List[str] = []
+                    avoid: List[str] = ["praise", "list_format", "overuse_classics"]
+                    if verified_found:
+                        req.append("check_verified_relevance")
                     if cref >= 12:
+                        req.append("ban_classic_quotes")
+                        ensure.append("one_concise_question")
+                    if req or ensure or avoid:
                         review_directives = {
-                            "required_actions": ["ban_classic_quotes", "one_concise_question"],
-                            "avoid": ["praise", "list_format", "overuse_classics"],
+                            "required_actions": req,
+                            "ensure": ensure,
+                            "avoid": avoid,
                             "tone_hint": "端的/助言調",
                             "ttl_turns": 2,
+                            "proposed_pushback_verified": "その引用、今の話題と関係ある？要点だけで話そう。",
                         }
                 except Exception:
                     review_directives = None
@@ -1212,7 +1313,7 @@ class NaturalConversationDirector:
             resp = self.client.chat(
                 model=self.entity_llm_model,
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                options={"temperature": 0},
+                options={"temperature": 0, "num_ctx": 4096, "num_batch": 128},
                 stream=False,
             )
             content = (resp.get("message") or {}).get("content")
@@ -1385,7 +1486,7 @@ class NaturalConversationDirector:
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                options={"temperature": 0.1},
+                options={"temperature": 0.1, "num_ctx": 4096, "num_batch": 128},
                 stream=False,
             )
             content = (resp.get("message") or {}).get("content")
@@ -1456,7 +1557,7 @@ class NaturalConversationDirector:
             resp = self.client.chat(
                 model=self.entity_llm_model,
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                options={"temperature": 0.1},
+                options={"temperature": 0.1, "num_ctx": 4096, "num_batch": 128},
                 stream=False,
             )
             content = (resp.get("message") or {}).get("content")
@@ -1541,7 +1642,7 @@ class NaturalConversationDirector:
             resp = self.client.chat(
                 model=self.entity_llm_model,
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                options={"temperature": 0.1},
+                options={"temperature": 0.1, "num_ctx": 4096, "num_batch": 128},
                 stream=False,
             )
             content = (resp.get("message") or {}).get("content")
@@ -1669,7 +1770,7 @@ class NaturalConversationDirector:
             resp = self.client.chat(
                 model=self.entity_llm_model,
                 messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}],
-                options={"temperature": 0.2},
+                options={"temperature": 0.2, "num_ctx": 4096, "num_batch": 128},
                 stream=False,
             )
             content = (resp.get("message") or {}).get("content")
@@ -1785,7 +1886,7 @@ class NaturalConversationDirector:
             resp = self.client.chat(
                 model=self.entity_llm_model,
                 messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
-                options={"temperature": 0},
+                options={"temperature": 0, "num_ctx": 4096, "num_batch": 128},
                 stream=False,
             )
             content = (resp.get("message") or {}).get("content")

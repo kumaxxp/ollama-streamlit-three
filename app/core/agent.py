@@ -268,6 +268,8 @@ class Agent:
                 try:
                     if isinstance(ws, list) and ws:
                         prompt_parts.append("\n【作品検証（Director）】")
+                        has_verified = False
+                        has_flagged = False
                         for item in ws[:2]:
                             if isinstance(item, dict):
                                 t = item.get('title')
@@ -278,7 +280,13 @@ class Agent:
                                     if u:
                                         line += f" / URL: {u}"
                                     prompt_parts.append(line)
+                                    if v == 'VERIFIED':
+                                        has_verified = True
+                                    if v in ('NG', 'AMBIGUOUS'):
+                                        has_flagged = True
                         prompt_parts.append("存在が曖昧/NGのものは、誤記や架空の可能性を短く確認してから話を進めてください。")
+                        if has_verified:
+                            prompt_parts.append("VERIFIEDでも文脈に関係ない引用は避け、要点だけ述べてください。関係なさそうなら短く突っ込んでOK。")
                 except Exception:
                     pass
             # Wikipediaスニペット（必要ならURLを1つだけ）
@@ -355,8 +363,11 @@ class Agent:
                 rd = director_findings.get('review_directives') or {}
                 if 'ban_classic_quotes' in (rd.get('required_actions') or []):
                     ban_quotes = True
+                # VERIFIED の関連性チェックを表示にも反映
+                if 'check_verified_relevance' in (rd.get('required_actions') or []):
+                    prompt_parts.append("VERIFIED作品でも、今の話題に無関係なら『その引用、今の話題と関係ある？』と短く確認してOK。")
         except Exception:
-            ban_quotes = False
+            pass
         if ban_quotes:
             prompt_parts.append("古典/名言/物語の引用は禁止（『〜曰く』『〜のように』等）。自分の言葉で述べる。")
         prompt_parts.append("褒め言葉は禁止")
@@ -395,11 +406,16 @@ class Agent:
                 options={
                     "temperature": self.temperature,
                     "top_p": 0.95,
-                    "seed": None
+            "seed": None,
+            # 安全な既定: KVキャッシュ/VRAM圧迫を抑える
+            "num_ctx": 4096,
+            "num_batch": 128,
                 },
                 stream=False
             )
             generated_text = response['message']['content']
+            # 思考過程やチェーン・オブ・ソートの露出を抑制
+            generated_text = self._sanitize_output(generated_text)
 
             # Post-check（キャラ混入検査）
             own_name = self.character['name']
@@ -435,6 +451,7 @@ class Agent:
                         stream=False
                     )
                     retried = response['message']['content']
+                    retried = self._sanitize_output(retried)
                     if self._check_character_leak(retried, own_name, other_names):
                         # 強制カット
                         generated_text = self._force_cut_single_speaker(retried, own_name, other_names)
@@ -476,6 +493,32 @@ class Agent:
         if req.strip() in system_prompt:
             return system_prompt
         return f"{system_prompt}\n{req}"
+
+    def _sanitize_output(self, text: str) -> str:
+        """
+        モデルが出力する思考過程（<think>...</think>、```reasoning ...``` 等）を取り除く。
+        目に見える最終回答のみを残す。
+        """
+        try:
+            import re
+            s = str(text)
+            # 完結したXML/タグ形式の思考ブロック
+            s = re.sub(r"(?is)<\s*(think|thought|scratchpad)\b[^>]*>.*?<\s*/\s*\1\s*>", "", s)
+            # 未閉じのタグが続いている場合は末尾まで抑止
+            s = re.sub(r"(?is)<\s*(think|thought|scratchpad)\b[^>]*>[\s\S]*$", "", s)
+            # フェンス付きコードブロック（reasoning/thought/think） 完結/未完の両方
+            s = re.sub(r"(?is)```\s*(reasoning|thought|think)[\s\S]*?```", "", s)
+            s = re.sub(r"(?is)```\s*(reasoning|thought|think)[\s\S]*$", "", s)
+            # 全角カギや日本語ラベルの思考ブロック 完結/未完
+            s = re.sub(r"(?s)【思考】[\s\S]*?【/思考】", "", s)
+            s = re.sub(r"(?s)【思考】[\s\S]*$", "", s)
+            # 先頭の『思考:』等の行を削除
+            s = re.sub(r"(?mi)^(思考|推論|考え|Reasoning|Thoughts?)\s*[:：].*$\n?", "", s)
+            # 余計な空白を整える
+            s = re.sub(r"\n{3,}", "\n\n", s).strip()
+            return s
+        except Exception:
+            return text
 
     def _build_structured_messages(self, context: Dict, system_prompt: str) -> List[Dict[str, str]]:
         """仕様 2.3 に沿ったメッセージ配列を構築"""
@@ -553,6 +596,8 @@ class Agent:
                 lines = ["【遵守指示（Director）】"]
                 if 'ban_classic_quotes' in reqs or 'overuse_classics' in avoids:
                     lines.append("- 古典/名言/物語の引用は禁止。『〜曰く』『〜のように』等を避け、自分の言葉で要点だけ述べる。")
+                if 'check_verified_relevance' in reqs:
+                    lines.append("- 検証済みの引用でも、主題に関係が薄いなら『その引用、今の話題と関係ある？』と短く確認してから要点だけ述べる。")
                 if 'one_concise_question' in (rd.get('ensure') or []):
                     lines.append("- 応答の最後に短い質問を1つだけ添える。")
                 if len(lines) > 1:

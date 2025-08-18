@@ -199,7 +199,10 @@ class DialogueManager:
                 ],
                 options={
                     "temperature": speaker.temperature,
-                    "top_p": 0.95
+                    "top_p": 0.95,
+                    # 安全な既定: KVキャッシュ/VRAM圧迫を抑える
+                    "num_ctx": 4096,
+                    "num_batch": 128,
                 },
                 stream=False
             )
@@ -255,7 +258,10 @@ class DialogueManager:
                 options={
                     "temperature": speaker.temperature,
                     "top_p": 0.95,
-                    "seed": None  # 多様性のため
+                    "seed": None,  # 多様性のため
+                    # 安全な既定: KVキャッシュ/VRAM圧迫を抑える
+                    "num_ctx": 4096,
+                    "num_batch": 128,
                 },
                 stream=False
             )
