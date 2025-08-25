@@ -324,6 +324,14 @@ with dialogue_container:
                             "heuristic": dbg.get("heuristic_entities"),
                             "llm": dbg.get("llm_entities"),
                         }, ensure_ascii=False, indent=2))
+                        # 追加: 軽量ファクトチェック（claims / findings）
+                        try:
+                            if isinstance(dbg.get("light_factcheck"), dict):
+                                lf = dbg.get("light_factcheck")
+                                st.caption("🧪 軽量ファクトチェック")
+                                st.code(json.dumps(lf, ensure_ascii=False, indent=2))
+                        except Exception:
+                            pass
                         if dbg.get("holistic_text"):
                             st.caption("🧠 ホリスティックレビュー(テキスト)")
                             st.write(dbg.get("holistic_text"))

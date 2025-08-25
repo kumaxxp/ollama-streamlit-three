@@ -388,7 +388,8 @@ class DialogueController:
     def _should_analyze(self) -> bool:
         """分析を実行すべきか判定"""
         # 設定された間隔でチェック
-        check_interval = self.config.director_config.get("check_interval", 2)
+        # 既定を 1（毎ターン分析）に変更し、介入頻度を上げる
+        check_interval = self.config.director_config.get("check_interval", 1)
         return self.state.turn_count % check_interval == 0
     
     def _perform_analysis(self) -> Dict[str, Any]:

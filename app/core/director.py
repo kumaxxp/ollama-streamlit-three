@@ -243,6 +243,68 @@ class NaturalConversationDirector:
         self._last_refocus_eval = -999
         self._refocus_cooldown = 3  # 何回の分析間隔おきに許可するか
 
+    # ===== 互換補助: UI/Manager が参照するユーティリティ =====
+    def generate_length_instruction(self, guide: str = "簡潔") -> str:
+        """自然言語の長さガイドを返す（後方互換）。
+        guide: "簡潔" | "標準" | "長め" | "現状維持"
+        """
+        g = (guide or "").strip()
+        if g in ("現状維持", "維持"):
+            return "応答は現状の長さで問題ありません。箇条書きや見出しは使わず、自然な会話文で。"
+        if g in ("長め", "やや長め"):
+            return "やや長めに、200〜300文字・最大4文で。前置きは短く、最後に1つだけ短い問いを添えて。"
+        if g in ("標準", "普通"):
+            return "標準的な長さで、120〜160文字・最大3文。箇条書きは禁止。"
+        # 既定: 簡潔
+        return "簡潔に、80〜120文字・最大2文。要点だけを述べ、過度な称賛や長い前置きは避ける。"
+
+    def should_end_dialogue(self, dialogue_history: List[Dict[str, Any]], turn_count: int) -> Tuple[bool, str]:
+        """対話終了の簡易判断（後方互換）。
+        - 既定で20ターン到達 or wrapフェーズ突入後に質問比率が十分なら終了提案。
+        """
+        try:
+            if int(turn_count) >= 20:
+                return True, "max_turns_reached"
+        except Exception:
+            pass
+        # 直近の流れから質問比率を推定
+        try:
+            stats = self._analyze(dialogue_history)
+            lo, hi = QUESTION_RATIO_TARGET
+            if self.current_phase == "wrap" and lo <= float(stats.get("question_ratio", 0.0)) <= hi and turn_count >= 16:
+                return True, "wrap_phase_completed"
+        except Exception:
+            pass
+        return False, "continue"
+
+    def build_history_metrics_block(self, recent_texts: List[str]) -> str:
+        """UI/Controllerで使用するメトリクスブロックを生成。
+        入力: 直近の発話テキスト（string配列）
+        出力例:
+        [history-metrics]\nclassic_refs = 3\nkyukokumei_refs = 0\nfood_refs = 0\n[/history-metrics]
+        """
+        try:
+            texts = [t for t in (recent_texts or []) if isinstance(t, str) and t.strip()]
+            if not texts:
+                return ""
+            # 古典/引用っぽさの簡易カウント（UI側のルールと整合）
+            classics_words = ["枕草子", "源氏物語", "徒然草", "平家物語", "方丈記", "竹取物語"]
+            classic_refs = 0
+            for t in texts:
+                classic_refs += sum(1 for w in classics_words if w in t)
+                classic_refs += len(re.findall(r"[「『][^」』]{4,30}[」』]", t))
+            kyukokumei_refs = 0  # 将来拡張: 旧国名の過剰検出など
+            food_refs = 0        # 例: 食に関する脱線検出のフック
+            return (
+                "[history-metrics]\n"
+                f"classic_refs = {int(classic_refs)}\n"
+                f"kyukokumei_refs = {int(kyukokumei_refs)}\n"
+                f"food_refs = {int(food_refs)}\n"
+                "[/history-metrics]"
+            )
+        except Exception:
+            return ""
+
     def plan_next_turn(self, dialogue_context: List[Dict[str, Any]]) -> Dict[str, Any]:
         """リズム/長さ/話法のガイドを決める。"""
         stats = self._analyze(dialogue_context)
