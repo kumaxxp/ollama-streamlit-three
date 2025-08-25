@@ -64,10 +64,19 @@ logs/
 data/dialogues/*.json
 data/dialogues/*.txt
 
+# App I/O and caches (generated)
+input/
+output/
+cache/
+output/lancedb/
+
 ###############################################
 # Streamlit local state
 ###############################################
-.streamlit/
+# Keep config.toml under version control, ignore secrets and local state
+.streamlit/*
+!.streamlit/config.toml
+!.streamlit/README.md
 
 ###############################################
 # Temporary/backup files
@@ -82,3 +91,11 @@ tmp/
 # Local config overrides (if any)
 ###############################################
 config/local_*.json
+settings.local.yaml
+settings.local.yml
+settings.local.json
+
+###############################################
+# Notebooks
+###############################################
+.ipynb_checkpoints/
