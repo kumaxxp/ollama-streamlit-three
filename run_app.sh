@@ -1,7 +1,17 @@
 #!/bin/bash
-# Advanced Dialogue System 起動スクリプト
+# Advanced Dialogue System 起動スクリプト（conda対応・安定化）
 
 echo "🎭 Advanced Dialogue System 起動中..."
+
+# conda 環境があれば自動有効化（ollama-chat 優先）
+if [ -f "${HOME}/miniconda3/etc/profile.d/conda.sh" ]; then
+    # shellcheck disable=SC1090
+    source "${HOME}/miniconda3/etc/profile.d/conda.sh"
+    if conda env list | grep -q "^ollama-chat\s"; then
+        conda activate ollama-chat >/dev/null 2>&1 || true
+        echo "🧪 Using conda env: $(python -V 2>/dev/null || echo unknown)"
+    fi
+fi
 
 # Python警告を制御
 export PYTHONWARNINGS="ignore::RuntimeWarning"
@@ -33,10 +43,9 @@ echo "🚀 アプリケーションを起動します..."
 echo "   URL: http://localhost:8501"
 echo ""
 
-# ログを抑制しながら起動
-streamlit run app/pages/03_Advanced_Dialogue_Refactored.py \
+# 直接起動（フィルタで重要ログを隠さない）
+python -m streamlit run app/pages/03_Advanced_Dialogue_Refactored.py \
     --server.port 8501 \
     --server.headless true \
     --browser.gatherUsageStats false \
-    --logger.level warning \
-    2>&1 | grep -v "RuntimeWarning" | grep -v "tracemalloc"
+    --logger.level info

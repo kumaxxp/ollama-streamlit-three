@@ -3,9 +3,14 @@ Streamlit Helper Functions
 元 03_Advanced_Dialogue.py（現: 03_Advanced_Dialogue_Refactored.py）から抽出した共通処理（モデル名修正版）
 """
 import streamlit as st
-import ollama
-_HAS_OLLAMA = True
-from typing import List, Dict, Optional
+# 安全な import（無い環境でもアプリが落ちないように）
+try:
+    import ollama  # type: ignore
+    _HAS_OLLAMA = True
+except Exception:
+    ollama = None  # type: ignore
+    _HAS_OLLAMA = False
+from typing import List, Dict, Optional, Any
 from app.core.model_utils import ModelManager
 
 @st.cache_data(ttl=300)
@@ -169,7 +174,7 @@ def get_theme_options() -> List[str]:
 
 def display_dialogue_turn(
     turn_data: Dict,
-    container: st.container
+    container: Any
 ) -> None:
     """
     対話ターンを表示
@@ -261,7 +266,7 @@ def check_ollama_connection() -> bool:
         st.warning("⚠️ `ollama` ライブラリが見つかりません。ローカルに ollama をインストールしていない場合、実際のモデル呼び出しはできません。")
         return True
     try:
-        client = ollama.Client()
+        client = ollama.Client()  # type: ignore
         client.list()
         return True
     except Exception:

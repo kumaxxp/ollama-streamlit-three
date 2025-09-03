@@ -1,13 +1,19 @@
 """
 Model Selection Utilities
-Ollamaモデルの動的取得と管理
+Ollamaモデルの動的取得と管理（安全化版）
 """
 
 import json
 import logging
 import subprocess
 from typing import List, Dict, Optional, Tuple
-import ollama
+# ollama Python クライアントが無い環境でも落ちないように安全化
+try:
+    import ollama  # type: ignore
+    _HAS_OLLAMA = True
+except Exception:
+    ollama = None  # type: ignore
+    _HAS_OLLAMA = False
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +23,13 @@ class ModelManager:
     """
     
     def __init__(self):
-        self.client = ollama.Client()
+        # クライアントは存在する場合のみ初期化
+        self.client = None
+        try:
+            if _HAS_OLLAMA:
+                self.client = ollama.Client()  # type: ignore
+        except Exception:
+            self.client = None
         self.model_config = self._load_model_config()
         
     def _load_model_config(self) -> Dict:
@@ -53,8 +65,11 @@ class ModelManager:
             利用可能なモデル名のリスト
         """
         try:
-            # Ollama Python Clientを使用
-            response = self.client.list()
+            # Ollama Python Clientを使用（可能なら）
+            if self.client is not None:
+                response = self.client.list()
+            else:
+                raise RuntimeError("ollama client unavailable")
             
             models = []
             if 'models' in response:
@@ -228,6 +243,8 @@ class ModelManager:
             モデル情報の辞書
         """
         try:
+            if self.client is None:
+                raise RuntimeError("ollama client unavailable")
             info = self.client.show(model_name)
             
             return {
@@ -240,7 +257,17 @@ class ModelManager:
             
         except Exception as e:
             logger.error(f"Failed to get model info for {model_name}: {e}")
-            
+
+            # 可能なら CLI 経由で最低限の情報を取得
+            try:
+                import subprocess
+                result = subprocess.run(["ollama", "show", model_name], capture_output=True, text=True, timeout=10)
+                if result.returncode == 0:
+                    txt = result.stdout.strip()
+                    return {"name": model_name, "raw": txt[:2000]}
+            except Exception:
+                pass
+
             # 設定ファイルから情報を取得
             for category in self.model_config.get("recommended_models", {}).get("dialogue_agents", {}).values():
                 for model in category:
@@ -336,9 +363,14 @@ class ModelManager:
         """
         try:
             logger.info(f"Pulling model: {model_name}")
-            self.client.pull(model_name)
-            return True
-            
+            if self.client is not None:
+                self.client.pull(model_name)
+                return True
+            # フォールバック: CLI
+            import subprocess
+            result = subprocess.run(["ollama", "pull", model_name], capture_output=True, text=True)
+            return result.returncode == 0
+
         except Exception as e:
             logger.error(f"Failed to pull model {model_name}: {e}")
             return False
