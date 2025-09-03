@@ -5,6 +5,8 @@
 echo "🚀 Advanced Dialogue System Launcher"
 echo "===================================="
 
+export DIRECTOR_STRONG_FACTCHECK=1
+
 # カラー設定
 RED='\033[0;31m'
 GREEN='\033[0;32m'

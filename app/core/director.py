@@ -17,6 +17,7 @@ import re
 from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime
 from .search_adapter import MCPWebSearchAdapter
+from .factcheck import FactCheckPipeline
 
 logger = logging.getLogger(__name__)
 
@@ -199,6 +200,14 @@ class NaturalConversationDirector:
         # MCP/検索
         self.use_mcp_search = bool(use_mcp)
         self.mcp_adapter = MCPWebSearchAdapter(language="ja") if self.use_mcp_search else None
+        # 強化版ファクトチェック（CoVe/FEVER/SelfConsistency）
+        self.use_stronger_factcheck = bool(int(os.getenv("DIRECTOR_STRONG_FACTCHECK", "0")))
+        self.factchecker = None
+        try:
+            if self.use_stronger_factcheck:
+                self.factchecker = FactCheckPipeline(ollama_client, model_extract=self.model_name, model_judge=self.model_name, language="ja")
+        except Exception:
+            self.factchecker = None
 
         # キャッシュ
         self.entity_cache = {}
@@ -522,6 +531,39 @@ class NaturalConversationDirector:
             offender_disp = last_entry.get("speaker") or ""
             offender_label = self._label_of(offender_disp)
             text0 = last_entry.get("message", "")
+
+            # A0) 強化版: CoVe抽出→証拠収集→FEVER判定→自己矛盾（有効時のみ）
+            if self.use_stronger_factcheck and self.factchecker and isinstance(text0, str) and len(text0) >= 20:
+                try:
+                    fc_res = self.factchecker.run(text0, max_claims=3)
+                    debug_info["strong_factcheck"] = fc_res
+                    # FEVERで Refuted or NotEnoughInfo が含まれていれば短いpushback
+                    flagged = False
+                    for r in (fc_res.get("results") or []):
+                        lab = (((r or {}).get("judgment") or {}).get("label") or "").strip()
+                        if lab in ("Refuted", "NotEnoughInfo"):
+                            flagged = True
+                            break
+                    if flagged:
+                        plan = self._build_pushback_plan(self._other(offender_label), "断定は避けて、条件と出典(1URL)を添えて？")
+                        plan = self._scale_plan_length(plan, factor=2, cap=200)
+                        return {
+                            "intervention_needed": True,
+                            "reason": "strong_factcheck_fever",
+                            "intervention_type": "challenge_and_verify",
+                            "message": json.dumps(plan, ensure_ascii=False),
+                            "response_length_guide": "簡潔",
+                            "confidence": 0.82,
+                            "director_debug": debug_info,
+                            "review_directives": {
+                                "required_actions": ["cite_one_url_if_available", "one_concise_question"],
+                                "avoid": ["praise", "list_format"],
+                                "tone_hint": "端的/助言調",
+                                "ttl_turns": 2,
+                            },
+                        }
+                except Exception:
+                    pass
 
             # A) 原子主張抽出
             claims = self._extract_atomic_claims(text0)

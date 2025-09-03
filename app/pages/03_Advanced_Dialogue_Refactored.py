@@ -332,6 +332,14 @@ with dialogue_container:
                                 st.code(json.dumps(lf, ensure_ascii=False, indent=2))
                         except Exception:
                             pass
+                        # 追加: 強化ファクトチェック（CoVe/FEVER/SelfConsistency）
+                        try:
+                            if isinstance(dbg.get("strong_factcheck"), dict):
+                                sf = dbg.get("strong_factcheck")
+                                st.caption("🧪 強化ファクトチェック (CoVe→FEVER→SelfConsistency)")
+                                st.code(json.dumps(sf, ensure_ascii=False, indent=2))
+                        except Exception:
+                            pass
                         if dbg.get("holistic_text"):
                             st.caption("🧠 ホリスティックレビュー(テキスト)")
                             st.write(dbg.get("holistic_text"))
