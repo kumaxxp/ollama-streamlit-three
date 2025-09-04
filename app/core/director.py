@@ -539,3 +539,150 @@ class NaturalConversationDirector:
 
 # 互換エイリアス
 AutonomousDirector = NaturalConversationDirector
+
+# === 追加: プロンプト定義（クラス上部 or __init__直下でも可） ===
+EXTRACT_SYSTEM = """あなたは辛口の査読者。比喩や価値判断を事実と混同しない。出力はJSONのみ。"""
+EXTRACT_INSTR = """目的: 入力本文から最大8件の命題を抽出し、タイプ付けし、本文からの引用と文字オフセットを付けて返す。
+タイプ: fact | causal | analogy | value | normative | prediction | definition | implicit
+必須: 各命題は quote.text と quote.span.start/end(0-based,end非包含)を持つ。出力はJSONのみ、余談禁止。
+
+出力スキーマ:
+{"claims":[{"id":"C1","text":"<命題>","type":"fact","quote":{"text":"<引用<=120字>","span":{"start":0,"end":10}}}]}
+
+本文:
+{{TEXT}}"""
+
+JUDGE_SYSTEM = """あなたは論証の査読者。命題の検証可能性を評価する。出力はJSONのみ。"""
+JUDGE_INSTR = """目的: 与えられた claims を判定して返す。
+判定: supported | contradicted | needs-evidence | non-falsifiable | unclear
+必須: 各判定に reason(1文) を付ける。needs-evidence なら required_evidence(データ/文献の型)を列挙。suggestion は任意。
+
+入出力:
+入力: {"claims":[{"id":"C1","text":"...","type":"fact"}]}
+出力:
+{"findings":[{"claim_id":"C1","status":"needs-evidence","reason":"...", "required_evidence":["..."], "suggestion":"..."}],
+ "summary":{"counts_by_status":{},"top_risks":[]}}"""
+
+# === 追加: LLM JSON ヘルパ ===
+def _llm_json(self, system: str, user: str) -> Optional[dict]:
+    if not self.client:
+        return None
+    resp = self.client.chat(
+        model=self.entity_llm_model,
+        messages=[{"role":"system","content":system},{"role":"user","content":user}],
+        options={"temperature":0.1, "num_ctx": 4096},
+        stream=False,
+    )
+    raw = (resp.get("message") or {}).get("content") or ""
+    # ゆるいJSON抽出
+    s = raw[raw.find("{") : raw.rfind("}")+1] if "{" in raw and "}" in raw else raw
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
+# === 置換: 原子主張抽出（LLM優先→既存ヒューリスティックにフォールバック） ===
+def _extract_atomic_claims(self, text: str) -> List[Dict[str, str]]:
+    if not text or len(text) < 15:
+        return []
+    out: List[Dict[str, str]] = []
+    # 1) LLMで抽出
+    try:
+        payload = EXTRACT_INSTR.replace("{{TEXT}}", text)
+        data = self._llm_json(EXTRACT_SYSTEM, payload)  # type: ignore[attr-defined]
+        claims = (data or {}).get("claims") or []
+        for i, c in enumerate(claims[:5], 1):
+            t = (c.get("text") or "").strip()
+            ty = (c.get("type") or "fact").lower()
+            if len(t) >= 6:
+                out.append({"id": f"C{i}", "text": t, "type": ty})
+        if out:
+            return out[:3]
+    except Exception:
+        pass
+
+    # 2) フォールバック: 既存ヒューリスティック
+    sentences = re.split(r"[。.!?！？]\s*", text.strip())
+    candidates: List[str] = []
+    for s in sentences:
+        s = s.strip()
+        if not s:
+            continue
+        if re.search(r"(は|とは).*(必要|重要|可能|増加|減少|達成|成立|求め|要る)", s):
+            candidates.append(s)
+        elif len(s) >= 20 and ("である" in s or "だ。" in s or "とされる" in s):
+            candidates.append(s)
+        if len(candidates) >= 2:
+            break
+    out = [{"id": f"C{i+1}", "text": c, "type": "fact"} for i, c in enumerate(candidates)]
+    return out[:3]
+
+# === 追加: 命題判定（LLM）。返り値は {claim_id: finding} マップ ===
+def _judge_claims_llm(self, claims: List[Dict[str, str]]) -> Dict[str, Dict[str, Any]]:
+    if not claims or not self.client:
+        return {}
+    inp = {"claims": [{"id": c["id"], "text": c["text"], "type": c.get("type","fact")} for c in claims]}
+    data = self._llm_json(JUDGE_SYSTEM, JUDGE_INSTR + "\n\n入力:\n" + json.dumps(inp, ensure_ascii=False))  # type: ignore[attr-defined]
+    findings = (data or {}).get("findings") or []
+    out = {}
+    for f in findings:
+        cid = f.get("claim_id")
+        if cid:
+            out[cid] = f
+    return out
+
+# === 置換: 軽量検証（LLM判定→既存ルール/検索の結果を統合） ===
+def _verify_claims_light(self, claims: List[Dict[str,str]]) -> List[Dict[str,Any]]:
+    if not claims:
+        return []
+    out: List[Dict[str, Any]] = []
+    # まず LLM 判定を取得（失敗時は空マップ）
+    judge_map = {}
+    try:
+        judge_map = self._judge_claims_llm(claims)
+    except Exception:
+        judge_map = {}
+
+    def map_status(s: str) -> str:
+        s = (s or "").lower()
+        if s in ("supported",):
+            return "true"
+        if s in ("contradicted",):
+            return "false"
+        # needs-evidence / non-falsifiable / unclear は unknown 扱い（押し返し対象）
+        return "unknown"
+
+    for c in claims:
+        q1, q2 = self._build_queries_for_claim(c)
+        hits: List[Dict[str, Any]] = []
+        try:
+            if self.use_mcp_search and self.mcp_adapter:
+                if q1: hits += self.mcp_adapter.search_snippets(q1, limit=3) or []
+                if q2 and q2 != q1: hits += self.mcp_adapter.search_snippets(q2, limit=3) or []
+        except Exception:
+            pass
+        hits = self._dedup_hits(hits)[:3]
+
+        # 既存の簡易ルール
+        verdict, reason = self._rule_judge_claim(c, hits)
+
+        # LLM判定があれば優先しつつ、証拠ヒットの有無も加味
+        f = judge_map.get(c["id"], {})
+        if f:
+            verdict = map_status(f.get("status"))
+            # 公的ソースに当たっていれば supported を true で上書き（保守的に強化）
+            if verdict != "true" and any(any(d in (h.get("url") or "") for d in [".go.jp", "data.gov", "who.int"]) for h in hits):
+                verdict = "true"
+            reason = f.get("reason") or reason
+
+        out.append({
+            "id": c["id"],
+            "claim": c["text"],
+            "type": c.get("type", "fact"),
+            "status": verdict,          # "true" | "false" | "unknown"（既存ロジック互換）
+            "reason": reason,
+            "suggestion": (f.get("suggestion") if f else None),
+            "required_evidence": (f.get("required_evidence") if f else []),
+            "evidence": hits
+        })
+    return out
