@@ -82,3 +82,9 @@ tmp/
 # Local config overrides (if any)
 ###############################################
 config/local_*.json
+
+###############################################
+# Caches and generated artifacts
+###############################################
+# Exclude app/runtime caches
+cache/
