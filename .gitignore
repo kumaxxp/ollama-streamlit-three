@@ -60,6 +60,9 @@ Thumbs.db
 # Logs
 *.log
 logs/
+# Data input/output (generated or local)
+input/
+output/
 # Dialogue run artifacts (keep directory, ignore JSON data files)
 data/dialogues/*.json
 data/dialogues/*.txt
