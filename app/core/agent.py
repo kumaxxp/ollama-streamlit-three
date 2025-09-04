@@ -416,6 +416,8 @@ class Agent:
             generated_text = response['message']['content']
             # 思考過程やチェーン・オブ・ソートの露出を抑制
             generated_text = self._sanitize_output(generated_text)
+            # 禁止フレーズの緩和置換
+            generated_text = self._mitigate_banned_phrases(generated_text)
 
             # Post-check（キャラ混入検査）
             own_name = self.character['name']
@@ -452,6 +454,7 @@ class Agent:
                     )
                     retried = response['message']['content']
                     retried = self._sanitize_output(retried)
+                    retried = self._mitigate_banned_phrases(retried)
                     if self._check_character_leak(retried, own_name, other_names):
                         # 強制カット
                         generated_text = self._force_cut_single_speaker(retried, own_name, other_names)
@@ -489,6 +492,8 @@ class Agent:
             f"- 出力はあなた自身の発言のみ。相手のセリフや名前は書かない。\n"
             f"- キャラクタ名や役割（{name}やA/B等）を出力に含めない。\n"
             f"- 出力の先頭に『名前:』や『A:』『B:』などのラベルを付けない。\n"
+            f"- ぶっきらぼう/挑発的な表現は避ける（例: 『…で？』『...で？』は禁止）。\n"
+            f"- 上記の代わりに丁寧な確認に言い換える（例: 『どういう意味？』『具体的には？』『もう少し教えて？』）。\n"
         )
         if req.strip() in system_prompt:
             return system_prompt
@@ -633,6 +638,24 @@ class Agent:
                 messages.append({"role": "user", "content": "（前の続き）"})
 
         return messages
+
+    def _mitigate_banned_phrases(self, text: str) -> str:
+        """頻出のぶっきらぼう表現を穏当な確認表現に置換する（最小限）。"""
+        try:
+            import re
+            s = str(text)
+            # 『…で？』『...で？』『…で?』『...で?』のみを対象。
+            patterns = [
+                r"…\s*で[？?]",
+                r"\.\.\.\s*で[？?]",
+            ]
+            for pat in patterns:
+                s = re.sub(pat, "、どういうこと？", s)
+            # 文末の『で？』に近いバリエーションを限定的に置換（直前3文字までの単語に続くケース）。
+            s = re.sub(r"([ぁ-んァ-ン一-龠々〆ヶa-zA-Z0-9]{0,3})で[？?](?=$)", r"\1ってどういうこと？", s)
+            return s
+        except Exception:
+            return text
 
     def _check_character_leak(self, output_text: str, own_name: str, other_names: List[str]) -> bool:
         import re
