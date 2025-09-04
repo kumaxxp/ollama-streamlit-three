@@ -13,6 +13,7 @@ from pathlib import Path
 from .director import AutonomousDirector
 from .agent import Agent
 from .dialogue_manager import DialogueManager
+from .coherence_reviewer import review_coherence
 
 
 @dataclass
@@ -315,6 +316,25 @@ class DialogueController:
         else:
             yield {"type": "agent_response", "data": {"agent": current_speaker, "response": response}}
         
+        # 直後に整合性レビューを実行してUIへ通知（軽量）
+        try:
+            # UI表示用に {speaker, message} の短い履歴へ変換
+            short_hist = []
+            if self.state.history:
+                for h in self.state.history[-6:]:
+                    role = h.get("role", "")
+                    # 表示名
+                    disp = self.agents[role].character.get("name", role) if role in self.agents else role
+                    content = h.get("content", "")
+                    msg = content.get("message") if isinstance(content, dict) else str(content)
+                    short_hist.append({"speaker": disp, "message": msg})
+            latest_text = response.get('message') if isinstance(response, dict) else str(response)
+            review = review_coherence(short_hist, latest_text, ollama_client=self.ollama_client, model_name=self.config.director_config.get('model', 'gemma3:4b'), temperature=float(self.config.director_config.get('temperature', 0.1)))
+            yield {"type": "coherence_review", "data": review}
+        except Exception as _e:
+            # 非致命（UIに出さない）
+            pass
+
         # 履歴を更新
         self._update_history(current_speaker, response)
         
@@ -322,6 +342,29 @@ class DialogueController:
         turn_time = time.time() - turn_start_time
         self._update_metrics(turn_time, len(response))
         
+        # 会話全体の短いレビューを生成してUIへ
+        try:
+            hist_for_review = []
+            if self.state.history:
+                for h in self.state.history[-10:]:
+                    role = h.get("role", "")
+                    disp = self.agents[role].character.get("name", role) if role in self.agents else role
+                    content = h.get("content", "")
+                    msg = content.get("message") if isinstance(content, dict) else str(content)
+                    hist_for_review.append({"speaker": disp, "message": msg})
+            from .conversation_reviewer import review_conversation_text
+            text_review = review_conversation_text(
+                hist_for_review,
+                ollama_client=self.ollama_client,
+                model_name=self.config.director_config.get('model', 'gemma3:4b'),
+                temperature=float(self.config.director_config.get('temperature', 0.2)),
+                theme=self.config.theme,
+            )
+            if text_review and text_review.strip():
+                yield {"type": "conversation_review", "data": {"text": text_review.strip()}}
+        except Exception:
+            pass
+
         yield {"type": "turn_complete", "data": self.get_state_summary()}
 
     def _stash_director_findings(self, intervention: Dict[str, Any]) -> None:

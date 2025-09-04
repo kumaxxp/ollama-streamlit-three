@@ -396,6 +396,26 @@ with dialogue_container:
             if show_analysis:
                 with st.expander("🧪 Director分析スナップショット", expanded=False):
                     st.code(json.dumps(entry["content"], ensure_ascii=False, indent=2))
+        elif entry["type"] == "conversation_review":
+            txt = (entry.get("content") or {}).get("text", "")
+            if txt:
+                with st.expander("📝 会話レビュー", expanded=False):
+                    st.write(txt)
+        elif entry["type"] == "coherence_review":
+            rev = entry.get("content") or {}
+            score = rev.get("coherence_score", 0)
+            with st.expander(f"🧭 整合性チェック（{score}/100）", expanded=(score < 70)):
+                st.write(rev.get("summary", ""))
+                issues = rev.get("issues") or []
+                if issues:
+                    for i, it in enumerate(issues[:3], start=1):
+                        st.markdown(f"**#{i} {it.get('type','issue')}**")
+                        if it.get("excerpt"):
+                            st.write("引用: " + str(it.get("excerpt")))
+                        if it.get("explain"):
+                            st.caption("理由: " + str(it.get("explain")))
+                if rev.get("suggest_fix"):
+                    st.info("提案: " + str(rev.get("suggest_fix")))
 
 # 自動スクロール用の空要素
 if 'auto_scroll' in locals() and auto_scroll:
@@ -464,6 +484,7 @@ if st.session_state.is_running and st.session_state.controller and st.session_st
                         "timestamp": datetime.now().isoformat(),
                         "detail": detail
                     })
+                    # 整合性レビュー結果（直後に流れてくるイベント）も履歴に載せるため、次ループで拾えるようにする
                 
                 elif event["type"] == "director_intervention":
                     # Director介入（詳細と併せて可視化）
@@ -484,6 +505,20 @@ if st.session_state.is_running and st.session_state.controller and st.session_st
                         "type": "director_analysis_event",
                         "content": analysis,
                         "timestamp": datetime.now().isoformat()
+                    })
+
+                elif event["type"] == "coherence_review":
+                    st.session_state.dialogue_history.append({
+                        "type": "coherence_review",
+                        "content": event["data"],
+                        "timestamp": datetime.now().isoformat(),
+                    })
+                
+                elif event["type"] == "conversation_review":
+                    st.session_state.dialogue_history.append({
+                        "type": "conversation_review",
+                        "content": event["data"],
+                        "timestamp": datetime.now().isoformat(),
                     })
                 
                 elif event["type"] == "turn_complete":
